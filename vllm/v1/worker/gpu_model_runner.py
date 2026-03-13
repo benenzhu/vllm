@@ -5780,17 +5780,54 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        num_warmups = 1
         for _ in range(num_warmups):
-            self._dummy_run(
-                desc.num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                force_attention=force_attention,
-                uniform_decode=desc.uniform,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=True,
-                remove_lora=False,
-                num_active_loras=desc.num_active_loras,
-            )
+            from contextlib import nullcontext
+            if False:
+                import torch.distributed as dist
+                if dist.is_initialized() and dist.get_rank() == 0:
+                    import debugpy
+                    debugpy.listen(("0.0.0.0", 5679))
+                    logger.info("debugpy waiting for attach on rank 0, port 5679 "
+                                "(CUDA graph capture)")
+                    debugpy.wait_for_client()
+                    debugpy.breakpoint()
+            from vllm.distributed.parallel_state import get_world_group
+            local_rank = get_world_group().local_rank
+            enable_profiler = (local_rank == 0) and self.vllm_config.profiler_config.torch_profiler_dir
+            if enable_profiler:
+                import os
+                os.system("mkdir -p GRAPH_CAP")
+                trace_dir = f"./GRAPH_CAP"
+                logger.info(f"zty Tracing dump to {trace_dir}")
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        trace_dir, worker_name=f"graph_capture_rank_{local_rank}", use_gzip=True
+                    ),
+                )
+            else:
+                profiler = nullcontext()
+            with profiler:
+                with torch.profiler.record_function(
+                    f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}"
+                ):
+                    self._dummy_run(
+                        desc.num_tokens,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        force_attention=force_attention,
+                        uniform_decode=desc.uniform,
+                        allow_microbatching=allow_microbatching,
+                        skip_eplb=True,
+                        remove_lora=False,
+                        num_active_loras=desc.num_active_loras,
+                    )
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
