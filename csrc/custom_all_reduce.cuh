@@ -333,8 +333,6 @@ template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
                                T* __restrict__ result, int rank, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   int part = size / ngpus;
@@ -394,6 +392,7 @@ __global__ void __launch_bounds__(512, 1)
           write_reg.data[i] = downcast_s<T>(add_reg.data[i]);
         tmp_out[idx - start] = write_reg;
       }
+
       __syncthreads();
     }
     barrier_at_end<ngpus>(sg, self_sg, rank);
