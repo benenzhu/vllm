@@ -621,9 +621,7 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
 #if defined(USE_ROCM)
-    // Match bench_kernels ROCm policy: at most 64 blocks; small tensors use 16.
-    int effective_block_cap = (bytes <= 256 * 1024) ? 16 : 64;
-    int blocks = std::min(effective_block_cap, (size + threads - 1) / threads);
+    int blocks = std::min(64, (size + threads - 1) / threads);
 #else
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 #endif
