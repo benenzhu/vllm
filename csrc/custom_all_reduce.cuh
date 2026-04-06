@@ -628,7 +628,7 @@ class CustomAllreduce {
 
 #if defined(USE_ROCM)
     const bool prefer_1stage_fully_connected =
-        (world_size_ <= 4 && bytes < 32 * 1024) ||
+        (world_size_ <= 4 && bytes <= 64 * 1024) ||
         (world_size_ <= 8 && bytes <= 64 * 1024);
 #else
     const bool prefer_1stage_fully_connected =
