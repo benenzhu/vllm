@@ -397,8 +397,11 @@ __global__ void __launch_bounds__(512, 1)
     }
     barrier_at_end<ngpus>(sg, self_sg, rank);
     for (int idx = tid_rocm; idx < largest_part; idx += stride_rocm) {
-      int dst_idx = (warp_id + rank) % ngpus * part + idx;
-      ((P*)result)[dst_idx] = tmps[warp_id][idx];
+      int gather_from_rank = (warp_id + rank) % ngpus;
+      if (gather_from_rank == ngpus - 1 || idx < part) {
+        int dst_idx = gather_from_rank * part + idx;
+        ((P*)result)[dst_idx] = tmps[warp_id][idx];
+      }
     }
   } else
 #endif
@@ -620,11 +623,7 @@ class CustomAllreduce {
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
-#if defined(USE_ROCM)
-    int blocks = std::min(64, (size + threads - 1) / threads);
-#else
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
-#endif
 
 #if defined(USE_ROCM)
     const bool prefer_1stage_fully_connected =
