@@ -360,6 +360,23 @@ def _gluon_scale_arg(
             f"cache token capacity ({scale.shape[1]} < {max_tokens})"
         )
     scale = scale[:, :max_tokens]
+    if num_kv_heads == 1:
+        # [1, max_tokens] is already byte-identical to the kernel's
+        # [phys, nkv=1, 16, 1] layout -- reshape without the two full-tensor
+        # copies below (they cost ~25MB of traffic per call at multi-M-token
+        # cache capacities, per layer per step). The slice above stays
+        # contiguous here (a size-1 leading dim does not constrain it), and the
+        # resulting strides match the general path's exactly.
+        return (
+            scale.view(num_phys_pages, ASM_PAGE_SIZE, 1)
+            .permute(0, 2, 1)
+            .unsqueeze(-1)
+        )
+    # Unreachable today: the sparse PA entry point rejects num_kv_heads != 1
+    # outright (MiniMaxM3SparseAiterPAImpl.forward), so every caller takes the
+    # branch above -- MiniMax-M3 has 4 KV heads and is served at TP4. Kept
+    # (untested) as the shape it would take once multi-KV-head TP is enabled;
+    # that change has to lift the entry-point guard anyway.
     return (
         scale.transpose(0, 1)
         .contiguous()
@@ -492,19 +509,23 @@ def _run_gluon_decode(
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
     compute_type = aiter_dtypes.fp8 if is_fp8 else q.dtype
     if is_fp8:
-        if _sides_are_packed(k_cache, v_cache) and not all(
-            scale is None or scale.numel() == 1 for scale in (k_scale, v_scale)
-        ):
-            raise NotImplementedError(
-                "MiniMax-M3 AITER sparse PA supports only scalar KV scales "
-                "when K and V pages share a block; per-token scales would "
-                "need the same page renumbering."
-            )
+        # Per-token scales work for BOTH plane layouts: K and V are addressed
+        # by the same (shared) page id -- the interleave offset lives in the V
+        # cache view, not in the id -- so a scale tensor indexed by
+        # shared-page-id * 16 + intra matches what the insert kernels write.
         k_scale_arg = _gluon_scale_arg(
             k_scale, num_phys_pages=nphys16, num_kv_heads=hkv
         )
+        # Same page-id space as K (see v_nphys16 comment above), and the gluon
+        # kernel asserts equal K/V scale shapes -- so slice by K's page count.
+        # The trailing pages' scale entries are never addressed: valid shared
+        # page ids stop at the true V extent.
         v_scale_arg = _gluon_scale_arg(
-            v_scale, num_phys_pages=v_nphys16, num_kv_heads=hkv
+            v_scale,
+            num_phys_pages=(
+                nphys16 if v_scale is not None and v_scale.numel() > 1 else v_nphys16
+            ),
+            num_kv_heads=hkv,
         )
     else:
         k_scale_arg = v_scale_arg = None
