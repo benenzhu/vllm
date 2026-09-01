@@ -33,6 +33,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -61,6 +62,7 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     is_shared_expert_quant_fse_compatible,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -327,6 +329,7 @@ class MiniMaxM3MoE(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
+        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -448,6 +451,7 @@ class MiniMaxM3MoE(nn.Module):
             ),
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.experts",
         )
 
@@ -563,6 +567,59 @@ class MiniMaxM3Attention(nn.Module):
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+_FUSED_QKNORM_INSERT_WARMED = False
+
+
+def _warmup_fused_qknorm_insert(device: torch.device) -> bool:
+    """Load + launch aiter's fused_qknorm_idxrqknorm once on tiny dummy data.
+
+    The op is JIT-loaded (hipModuleLoad) on first call; without this warmup the
+    first call happens inside CUDA-graph capture, which crashes the worker
+    natively. Runs once per process, at module construction time. Returns
+    False (and the caller disables the fused path) if the op is unavailable.
+    """
+    global _FUSED_QKNORM_INSERT_WARMED
+    if _FUSED_QKNORM_INSERT_WARMED:
+        return True
+    try:
+        from aiter import fused_qknorm_idxrqknorm
+    except ImportError:
+        return False
+    try:
+        nh, nkv, hd, rot = 2, 1, 128, 64
+        niq, ihd = 1, 128
+        total = (nh + 2 * nkv) * hd + (niq + 1) * ihd
+        qkv = torch.zeros(1, total, device=device, dtype=torch.bfloat16)
+        w = torch.ones(hd, device=device, dtype=torch.bfloat16)
+        cos_sin = torch.zeros(4, rot, device=device, dtype=torch.bfloat16)
+        pos = torch.zeros(1, device=device, dtype=torch.long)
+        slot = torch.zeros(1, device=device, dtype=torch.long)
+        fp8_dtype = current_platform.fp8_dtype()
+        x = 16
+        kc = torch.zeros(1, nkv, hd // x, 16, x, device=device, dtype=fp8_dtype)
+        vc = torch.zeros(1, nkv, 16 // x, hd, x, device=device, dtype=fp8_dtype)
+        ic = torch.zeros(1, 16, ihd, device=device, dtype=torch.bfloat16)
+        q_out = torch.empty(1, nh * hd, device=device, dtype=torch.bfloat16)
+        iq_out = torch.empty(1, niq * ihd, device=device, dtype=torch.bfloat16)
+        scale = torch.ones(nkv, 16, device=device, dtype=torch.float32)
+        fused_qknorm_idxrqknorm(
+            qkv, w, w, cos_sin, pos, nh, nkv, rot, 1e-6,
+            w[:ihd], w[:ihd], niq, slot, kc, vc, ic, 16,
+            q_out, iq_out, slot,
+            kv_cache_dtype="fp8", index_cache_dtype="auto",
+            k_scale=scale, v_scale=scale, asm_layout=True,
+        )
+        torch.cuda.synchronize(device)
+        _FUSED_QKNORM_INSERT_WARMED = True
+        return True
+    except Exception as e:  # noqa: BLE001 -- any failure just disables the path
+        logger.warning_once(
+            "MiniMax-M3 fused qknorm insert warmup failed (%s); "
+            "falling back to the unfused kernels.", e
+        )
+        return False
 
 
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
@@ -701,6 +758,18 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_k = torch.tensor([])
         self.kv_cache_v = torch.tensor([])
         self._aiter_sparse_pa_cache_data_ptr = 0
+        # Fully-fused qk-norm + rope + KV/index insert (aiter
+        # fused_qknorm_idxrqknorm): replaces the QNormRopeKVInsert +
+        # reshape_and_cache + insert_index_cache kernel trio. fp8 caches get
+        # per-token dynamic dequant scales (written by the kernel), replacing
+        # the uncalibrated static 1.0 scale. Resolved lazily on first forward.
+        self._fused_qknorm_insert = None
+        self._fused_qknorm_insert_checked = not _warmup_fused_qknorm_insert(
+            torch.device(f"cuda:{torch.cuda.current_device()}")
+        )
+        self._pertoken_k_scale: torch.Tensor | None = None
+        self._pertoken_v_scale: torch.Tensor | None = None
+        self._fused_cos_sin_cache: torch.Tensor | None = None
         # Self-contained nn.Module: owns its side cache, selects its impl in init
         # (Triton on ROCm, where the SM100 gate is always False).
         self.indexer = MiniMaxM3Indexer(
@@ -802,6 +871,166 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self._ensure_aiter_sparse_pa_kv_cache()
         return self.kv_cache_k, self.kv_cache_v
 
+    def _aiter_sparse_pa_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Token slots for the page-16 cache views. Separate K/V planes keep
+        the linear token slot; the fused (interleaved) layout needs rebasing."""
+        if value_cache.shape[0] == key_cache.shape[0]:
+            return slot_mapping
+        attn_metadata = get_forward_context().attn_metadata
+        page16_slot_mapping = None
+        if isinstance(attn_metadata, dict):
+            main_md = attn_metadata[self.layer_name]
+            assert isinstance(main_md, MiniMaxM3SparseMetadata)
+            page16_slot_mapping = main_md.page16_slot_mapping
+        if (
+            page16_slot_mapping is None
+            or page16_slot_mapping.shape != slot_mapping.shape
+        ):
+            page16_slot_mapping = minimax_m3_rebase_slots_to_page16(
+                slot_mapping, self.kv_cache.shape[2]
+            )
+        return page16_slot_mapping
+
+    def _try_fused_qknorm_insert(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        q_out: torch.Tensor,
+        index_q_out: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> bool:
+        """One aiter kernel for the whole attention pre-processing of the
+        AITER sparse-PA path: per-head Gemma QK-norm + partial NeoX RoPE +
+        page-16 SHUFFLE K/V insert + index-key insert, reading the packed
+        ``[q | k | v | index_q | index_k]`` tensor in place and writing the
+        normed/roped q / index_q into ``q_out`` / ``index_q_out``.
+
+        Replaces fused_minimax_m3_qknorm_rope_kv_insert +
+        reshape_and_cache(asm_layout) + minimax_m3_insert_index_cache. For fp8
+        caches the kernel computes per-token dynamic dequant scales; the
+        attention reads them back via ``_k_scale``/``_v_scale`` (the gluon
+        backend accepts [num_kv_heads, max_kv_tokens] scales).
+
+        Returns False (caller falls back to the unfused trio) when the layout
+        prerequisites are not met.
+        """
+        if self.num_kv_heads != 1:
+            # The [nkv, max_tokens] scale view only matches the kernel's
+            # [page16, nkv, 16] scale layout byte-for-byte at nkv == 1 (which
+            # this whole backend already requires).
+            return False
+        if not self._fused_qknorm_insert_checked:
+            self._fused_qknorm_insert_checked = True
+            try:
+                from aiter import fused_qknorm_idxrqknorm
+
+                self._fused_qknorm_insert = fused_qknorm_idxrqknorm
+            except ImportError:
+                self._fused_qknorm_insert = None
+        if self._fused_qknorm_insert is None:
+            return False
+
+        index_cache = self.indexer.index_cache.kv_cache
+        if index_cache.numel() == 0 or not index_cache.is_contiguous():
+            return False
+        index_cache_arg = index_cache
+
+        key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
+        slot16 = self._aiter_sparse_pa_slot_mapping(
+            slot_mapping, key_cache, value_cache
+        )
+        # Scale/attention-side capacity is defined by the FULL K view's page
+        # count (the attention path slices scales by it), captured before the
+        # equal-size trim below.
+        full_pages = key_cache.shape[0]
+        if value_cache.shape[0] != key_cache.shape[0]:
+            # Interleaved fused cache: the V view drops v_page_offset leading
+            # pages so K and V share one page id. The kernel's static shape
+            # check wants size(0) equal; trim K to V's page count instead.
+            # Valid K page ids stop at (num_128_blocks-1)*block_pages +
+            # pages_per_side - 1, which is strictly below V's extent, so the
+            # trimmed view still covers every page the slot mapping can name.
+            key_cache = key_cache[: value_cache.shape[0]]
+            # Same story for the index cache's capacity check, which is scaled
+            # by key_cache.size(0) -- twice the real token capacity under the
+            # interleaved layout. Writes are bounded by index_slot_mapping.
+            # (Both widenings belong upstream in aiter's shape checks.)
+            need = key_cache.shape[0] * key_cache.shape[3] * self.idx_head_dim
+            if index_cache_arg.numel() < need:
+                index_cache_arg = torch.as_strided(
+                    index_cache_arg.view(-1), (need,), (1,)
+                )
+
+        is_fp8 = is_quantized_kv_cache(self.kv_cache_dtype)
+        k_scale = v_scale = None
+        if is_fp8:
+            max_tokens = full_pages * key_cache.shape[3]
+            if (
+                self._pertoken_k_scale is None
+                or self._pertoken_k_scale.shape[1] < max_tokens
+            ):
+                # No initialization on purpose: every slot the attention reads
+                # is written (value + scale together) by this kernel first.
+                # An initializing fill here would also be recorded into the
+                # CUDA graph (first call runs under capture) and wipe the
+                # scales on every replay.
+                self._pertoken_k_scale = torch.empty(
+                    self.num_kv_heads,
+                    max_tokens,
+                    dtype=torch.float32,
+                    device=qkv.device,
+                )
+                self._pertoken_v_scale = torch.empty_like(self._pertoken_k_scale)
+            k_scale, v_scale = self._pertoken_k_scale, self._pertoken_v_scale
+
+        cos_sin = self._fused_cos_sin_cache
+        if cos_sin is None or cos_sin.dtype != qkv.dtype:
+            cos_sin = self.rotary_emb.cos_sin_cache.to(
+                device=qkv.device, dtype=qkv.dtype
+            ).contiguous()
+            self._fused_cos_sin_cache = cos_sin
+
+        self._fused_qknorm_insert(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.num_idx_heads,
+            slot16,
+            key_cache,
+            value_cache,
+            index_cache_arg,
+            key_cache.shape[3],  # SHUFFLE page size (16)
+            q_out,
+            index_q_out,
+            index_slot_mapping,
+            kv_cache_dtype=self.kv_cache_dtype if is_fp8 else "auto",
+            # vLLM's index score/topk kernels read a bf16 index cache; keep it
+            # that way instead of following the KV cache to fp8.
+            index_cache_dtype="auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
+            asm_layout=True,
+        )
+        if is_fp8:
+            # Hand the per-token scales to the attention backend.
+            self._k_scale = k_scale
+            self._v_scale = v_scale
+        return True
+
     def _insert_aiter_sparse_pa_kv(
         self,
         k: torch.Tensor,
@@ -819,29 +1048,30 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
 
         key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
-        if value_cache.shape[0] != key_cache.shape[0]:
-            attn_metadata = get_forward_context().attn_metadata
-            page16_slot_mapping = None
-            if isinstance(attn_metadata, dict):
-                main_md = attn_metadata[self.layer_name]
-                assert isinstance(main_md, MiniMaxM3SparseMetadata)
-                page16_slot_mapping = main_md.page16_slot_mapping
-            if (
-                page16_slot_mapping is None
-                or page16_slot_mapping.shape != slot_mapping.shape
-            ):
-                page16_slot_mapping = minimax_m3_rebase_slots_to_page16(
-                    slot_mapping, self.kv_cache.shape[2]
-                )
-            slot_mapping = page16_slot_mapping
+        slot_mapping = self._aiter_sparse_pa_slot_mapping(
+            slot_mapping, key_cache, value_cache
+        )
         kv_cache_dtype = (
             self.kv_cache_dtype
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else "auto"
         )
+        # aiter's cache kernel indexes the source as token_idx * stride(0) + i
+        # (cache_kernels.cu reads key.stride(0) itself), so the row-strided
+        # views sliced out of the packed qkv tensor are fine as-is -- as long as
+        # each token's [num_heads, head_dim] payload is contiguous. The
+        # .contiguous() calls this replaces cost two ~4us copy kernels per
+        # layer at decode.
+        def _rows_contiguous(t: torch.Tensor) -> bool:
+            return t.stride(2) == 1 and t.stride(1) == t.shape[2]
+
+        if not _rows_contiguous(k):
+            k = k.contiguous()
+        if not _rows_contiguous(v):
+            v = v.contiguous()
         reshape_and_cache(
-            k.contiguous(),
-            v.contiguous(),
+            k,
+            v,
             key_cache,
             value_cache,
             slot_mapping,
@@ -942,7 +1172,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         else:
             index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
             index_q = qkv.new_empty((num_tokens, self.index_q_size))
-            if self.use_aiter_sparse_pa:
+            if self.use_aiter_sparse_pa and self._try_fused_qknorm_insert(
+                qkv, positions, q, index_q, main_slot_mapping, index_slot_mapping
+            ):
+                pass  # everything (norm/rope/kv/index inserts, q outputs) done
+            elif self.use_aiter_sparse_pa:
                 ops.fused_minimax_m3_qknorm_rope_kv_insert(
                     qkv,
                     self.q_norm.weight,
@@ -1068,21 +1302,40 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         # Dense layers store the FFN under `mlp`; MoE layers under
         # `block_sparse_moe` -- matching the checkpoint's naming.
+        # The FFN is built un-reduced (reduce_results=False); forward() issues
+        # the all-reduce itself unless defer_ffn_allreduce is set, in which case
+        # the NEXT layer fuses it into its input_layernorm (or the model fuses
+        # it into the final norm). Both flags are wired by MiniMaxM3Model after
+        # construction; standalone layers (MTP) keep the defaults and behave
+        # exactly as before -- same all-reduce kernel, issued here instead of
+        # inside FusedMoE.
+        self.fuse_input_allreduce = False
+        self.defer_ffn_allreduce = False
+        tp_size = get_tensor_model_parallel_world_size()
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
             self.block_sparse_moe = MiniMaxM3MoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.block_sparse_moe",
+            )
+            # The factory may veto the deferred reduce (EP all2all kernels,
+            # sequence parallel); only then is the output actually partial.
+            self._ffn_output_is_partial = (
+                self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
+                and tp_size > 1
             )
         else:
             self.mlp = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )
+            self._ffn_output_is_partial = tp_size > 1
 
         # config.use_gemma_norm is True for M3 -> Gemma-style RMSNorm.
         self.input_layernorm = MiniMAXGemmaRMSNorm(
@@ -1099,7 +1352,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
+        if self.fuse_input_allreduce and residual is not None:
+            # Completes the PREVIOUS layer's deferred FFN all-reduce, fused with
+            # this layer's input_layernorm.
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -1114,6 +1373,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
+        # The FFN was built un-reduced. Either hand the partial sum to the next
+        # layer's fused input_layernorm (defer_ffn_allreduce, wired by the
+        # model) or reduce here -- the same collective FusedMoE used to issue.
+        if self._ffn_output_is_partial and not self.defer_ffn_allreduce:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states, residual
 
 
@@ -1181,6 +1445,43 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # Cross-layer all-reduce/RMSNorm fusion: a layer whose FFN output is
+        # left un-reduced has that all-reduce fused into the next layer's
+        # input_layernorm (or the final norm). Mirrors nvidia/model.py. Single
+        # PP stage only -- IntermediateTensors must carry fully-reduced hidden
+        # states across stages. _set_aux_hidden_state_layers() later un-defers
+        # the layers whose outputs feed EAGLE-3 aux hidden states.
+        self.fuse_final_norm_allreduce = False
+        if get_pp_group().world_size == 1:
+            prev = None
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                if prev is not None and prev._ffn_output_is_partial:
+                    prev.defer_ffn_allreduce = True
+                    layer.fuse_input_allreduce = True
+                prev = layer
+            if prev is not None and prev._ffn_output_is_partial:
+                prev.defer_ffn_allreduce = True
+                self.fuse_final_norm_allreduce = True
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        # forward() records layer i's output under aux index i+1, and
+        # _maybe_add_hidden_state reads `hidden_states` directly -- a deferred
+        # (per-rank partial) FFN output would feed the EAGLE-3 draft 1/TP of
+        # the real value. Un-defer exactly those layers.
+        for aux_idx in layers:
+            li = aux_idx - 1  # aux 0 is the embedding output; nothing to fix
+            if not (self.start_layer <= li < self.end_layer):
+                continue
+            layer = self.layers[li]
+            if not layer.defer_ffn_allreduce:
+                continue
+            layer.defer_ffn_allreduce = False
+            if li + 1 < self.end_layer:
+                self.layers[li + 1].fuse_input_allreduce = False
+            else:
+                self.fuse_final_norm_allreduce = False
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1215,7 +1516,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.fuse_final_norm_allreduce:
+            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
