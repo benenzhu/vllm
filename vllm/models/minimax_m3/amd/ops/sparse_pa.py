@@ -32,31 +32,28 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
 
 
 @triton.jit
-def _write_sparse_block_table_row(
-    topk_row,  # [topk] int32, selected logical block ids for this query
+def _write_sparse_block_table_row_from_vals(
+    blk,  # [BLOCK_SIZE_T] int32 vector of logical block ids, -1 = invalid
     bt_row,  # [max_blocks] int32, this request's logical page table
     sbt_row,  # [topk * PAGES_PER_BLOCK] int32, physical 16-page table
     ctx_ptr,  # int32, this query's attended context length
     abs_pos,  # absolute position of this query token, may be negative
     max_topk,
-    stride_topk_k,
     SPARSE_BLOCK_SIZE_C: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     BLOCK_PAGE_STRIDE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
-    """Compact one query's selected logical blocks into physical page-16 ids.
+    """Value-based core of the sparse-block-table row writer.
 
-    ``BLOCK_PAGE_STRIDE`` is how many page ids a block spans, which is
-    ``PAGES_PER_BLOCK`` when each K/V side is its own dense plane and twice
-    that when both sides share a block. Padded rows carry a negative
-    ``abs_pos``, which clamps the causal range to empty.
+    Identical to :func:`_write_sparse_block_table_row` except the selected
+    logical block ids arrive as an in-register vector instead of a pointer —
+    this lets the top-k merge kernel build the table in the same launch
+    ([m3-compare F3] fused merge + build_sparse_block_table).
     """
     causal_len = tl.maximum(abs_pos + 1, 0)
     self_blk = abs_pos // SPARSE_BLOCK_SIZE_C
 
-    off_t = tl.arange(0, BLOCK_SIZE_T)
-    blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
     valid = (causal_len > 0) & (blk >= 0) & (blk <= self_blk)
     is_tail = valid & (blk == self_blk)
     is_full = valid & (blk < self_blk)
@@ -87,6 +84,43 @@ def _write_sparse_block_table_row(
     ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
     ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, causal_len))
     tl.store(ctx_ptr, ctx)
+
+
+@triton.jit
+def _write_sparse_block_table_row(
+    topk_row,  # [topk] int32, selected logical block ids for this query
+    bt_row,  # [max_blocks] int32, this request's logical page table
+    sbt_row,  # [topk * PAGES_PER_BLOCK] int32, physical 16-page table
+    ctx_ptr,  # int32, this query's attended context length
+    abs_pos,  # absolute position of this query token, may be negative
+    max_topk,
+    stride_topk_k,
+    SPARSE_BLOCK_SIZE_C: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+    BLOCK_PAGE_STRIDE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """Compact one query's selected logical blocks into physical page-16 ids.
+
+    ``BLOCK_PAGE_STRIDE`` is how many page ids a block spans, which is
+    ``PAGES_PER_BLOCK`` when each K/V side is its own dense plane and twice
+    that when both sides share a block. Padded rows carry a negative
+    ``abs_pos``, which clamps the causal range to empty.
+    """
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
+    _write_sparse_block_table_row_from_vals(
+        blk,
+        bt_row,
+        sbt_row,
+        ctx_ptr,
+        abs_pos,
+        max_topk,
+        SPARSE_BLOCK_SIZE_C,
+        PAGES_PER_BLOCK,
+        BLOCK_PAGE_STRIDE,
+        BLOCK_SIZE_T,
+    )
 
 
 @triton.jit
@@ -167,6 +201,64 @@ def _build_sparse_block_table_prefill_kernel(
         BLOCK_PAGE_STRIDE,
         BLOCK_SIZE_T,
     )
+
+
+# --- [m3-compare F3] fused merge + build_sparse_block_table handoff ---------
+# The decode top-k merge kernel (amd/ops/index_topk.py) can build the sparse
+# block table in the same launch, saving one kernel per layer. The indexer
+# needs BLOCK_PAGE_STRIDE (a property of the attention layer's KV cache
+# tensors), published here by the attention side; the prebuilt (sparse_bt,
+# sparse_ctx) pair rides a module slot from the indexer to the attention call
+# of the same layer (single-threaded; python runs once per layer during
+# cudagraph capture, so the fused launch is recorded exactly like the two
+# separate launches were).
+_BLOCK_PAGE_STRIDE_HINT: int | None = None
+_PREBUILT_DECODE_SBT: tuple | None = None
+# fused-path self-validation: first few eager consumes are compared against
+# the unfused builder; any mismatch permanently disables the fusion.
+_SBT_FUSE_STATE = {"validations_left": 3, "disabled": False}
+
+
+def get_block_page_stride_hint() -> int | None:
+    if _SBT_FUSE_STATE["disabled"]:
+        return None
+    return _BLOCK_PAGE_STRIDE_HINT
+
+
+def stash_prebuilt_decode_sbt(
+    topk_idx: torch.Tensor,
+    block_page_stride: int,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+) -> None:
+    """Called by the indexer after the fused merge+build kernel."""
+    global _PREBUILT_DECODE_SBT
+    _PREBUILT_DECODE_SBT = (
+        topk_idx.data_ptr(),
+        tuple(topk_idx.shape),
+        block_page_stride,
+        sparse_bt,
+        sparse_ctx,
+    )
+
+
+def _take_prebuilt_decode_sbt(
+    topk_idx: torch.Tensor, block_page_stride: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Consume the prebuilt pair iff it matches this exact topk tensor."""
+    global _PREBUILT_DECODE_SBT
+    pre = _PREBUILT_DECODE_SBT
+    _PREBUILT_DECODE_SBT = None
+    if pre is None:
+        return None
+    ptr, shape, bps, sparse_bt, sparse_ctx = pre
+    if (
+        ptr == topk_idx.data_ptr()
+        and shape == tuple(topk_idx.shape)
+        and bps == block_page_stride
+    ):
+        return sparse_bt, sparse_ctx
+    return None
 
 
 def _alloc_sparse_block_table(
@@ -402,13 +494,45 @@ def minimax_m3_sparse_attn_decode_aiter(
     v_scale: torch.Tensor | None = None,
     decode_query_len: int = 1,
 ) -> None:
-    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
-        topk_idx,
-        block_table,
-        seq_lens,
-        decode_query_len,
-        _block_page_stride(k_cache, v_cache),
-    )
+    bps = _block_page_stride(k_cache, v_cache)
+    # [m3-compare F3] publish the stride so the indexer's merge kernel can
+    # build the table in-launch on subsequent steps; consume a prebuilt pair
+    # when the indexer produced one for this exact topk tensor.
+    global _BLOCK_PAGE_STRIDE_HINT
+    _BLOCK_PAGE_STRIDE_HINT = bps
+    pre = _take_prebuilt_decode_sbt(topk_idx, bps)
+    if (
+        pre is not None
+        and _SBT_FUSE_STATE["validations_left"] > 0
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # one-time self-validation (eager only): the fused merge kernel must
+        # produce byte-identical tables to the standalone builder. Catches a
+        # block_table mismatch between indexer and attention metadata.
+        ref_bt, ref_ctx = minimax_m3_build_sparse_block_table_decode(
+            topk_idx, block_table, seq_lens, decode_query_len, bps
+        )
+        if torch.equal(ref_bt, pre[0]) and torch.equal(ref_ctx, pre[1]):
+            _SBT_FUSE_STATE["validations_left"] -= 1
+        else:
+            _SBT_FUSE_STATE["disabled"] = True
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[m3-compare F3] fused sparse-block-table mismatch vs "
+                "reference builder; fusion permanently disabled"
+            )
+            pre = None
+    if pre is not None:
+        sparse_bt, sparse_ctx = pre
+    else:
+        sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
+            topk_idx,
+            block_table,
+            seq_lens,
+            decode_query_len,
+            bps,
+        )
     _run_gluon_decode(
         q,
         k_cache,
