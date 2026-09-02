@@ -129,6 +129,16 @@ class GateLinear(ReplicatedLinear):
             and self.out_dtype == torch.float32
         )
 
+        # ROCm Triton fp32-weight router GEMM eligibility: replaces the
+        # bf16->fp32 upcast copy + hipBLASLt fp32 split-K pair with one Triton
+        # kernel (fp32 accumulation, same accuracy class) for decode-sized M.
+        self.allow_rocm_triton_fp32_router_gemm = (
+            not bias
+            and self.weight.dtype == torch.float32
+            and self.out_dtype == torch.float32
+            and current_platform.is_rocm()
+        )
+
         # cuteDSL ll_bf16_gemm eligibility. Any dims supported, but SM90+ required bc:
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
@@ -216,6 +226,17 @@ class GateLinear(ReplicatedLinear):
             )
 
             output = bf16x3_router_gemm(x, self.weight)
+            return output, None
+
+        # ROCm tier: Triton bf16 x fp32-weight GEMM (fp32 accum). The
+        # num_tokens branch lives inside the custom op (compile-safe); large M
+        # falls back to F.linear inside the op.
+        if self.allow_rocm_triton_fp32_router_gemm and x.dtype == torch.bfloat16:
+            from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm_triton import (  # noqa: E501
+                rocm_fp32_router_gemm_dispatch,
+            )
+
+            output = rocm_fp32_router_gemm_dispatch(x, self.weight)
             return output, None
 
         # Tier 5: cuBLAS bf16→fp32
