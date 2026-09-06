@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sort-free FlyDSL decode MoE for MiniMax-M3 MXFP4 weights on gfx950 (bf16 x).
+"""FlyDSL decode MoE for MiniMax-M3 MXFP4 weights on gfx950 (bf16 x), M <= 256.
 
 The aiter CK path runs five kernels per MoE layer at decode batch sizes
-(sort, zero-fill, gate/up GEMM, activation, down GEMM). At M <= 16 tokens the
-whole layer is HBM-bound on the expert weights, so the launch and sync gaps
-between those kernels are a large share of the time. This package keeps two
-FlyDSL kernels:
+(sort, zero-fill, gate/up GEMM, activation, down GEMM). At decode batch
+sizes the whole layer is HBM-bound on the expert weights, so the launch and
+sync gaps between those kernels are a large share of the time. This package
+keeps two FlyDSL GEMM kernels (plus one small sort kernel above 16 tokens):
 
 * ``gemm1``: gate/up GEMM (bf16 x MXFP4, MFMA 16x16x32) fused with the
   swiglu-OAI activation, bf16 out.
 * ``gemm2``: down GEMM, split-K over 3 CTAs, routing-weighted bf16 atomic add
   into the (zeroed) output.
 
-Neither needs ``moe_sorting``: every m-block is one routing pair
-``(token, topk slot)`` and derives its expert id and its rows from ``topk_ids``
-with a wave ballot (``n_tokens <= TILE_M`` rows fit one block; the always-on
-shared expert owns all ``n_tokens`` rows, which pins ``TILE_M = 16``).
+At ``M <= 16`` neither needs ``moe_sorting``: every m-block is one routing
+pair ``(token, topk slot)`` and derives its expert id and its rows from
+``topk_ids`` with a wave ballot (``n_tokens <= TILE_M`` rows fit one block; the
+always-on shared expert owns all ``n_tokens`` rows, which pins ``TILE_M = 16``).
 gemm1's first blocks zero the output so gemm2 can accumulate atomically.
+
+At ``16 < M <= 256`` the same GEMMs run on expert-sorted rows: ``sort_decode``
+(one launch: block 0 sorts the routing pairs by expert with LDS counters, the
+other blocks zero the output; aiter's ``moe_sorting`` contract) feeds gemm1 and
+gemm2 the per-block expert ids and token ids. Above 64 tokens gemm2 drops the
+split-K (fewer atomics); aiter's own two sort kernels cost ~9.6 us here.
 
 Only used when every condition below holds; otherwise the layer keeps the
 aiter path untouched:
@@ -31,12 +37,15 @@ aiter path untouched:
   expert bias, no expert parallelism, ``apply_router_weight_on_input`` off;
 * hidden size a multiple of 256, per-partition intermediate size a multiple
   of 768 (MiniMax-M3 at TP4: 6144 / 768);
-* at call time: ``M <= 16`` contiguous bf16 tokens and no unfused shared
+* at call time: ``M <= 256`` contiguous bf16 tokens and no unfused shared
   experts (the shared expert must be folded into ``topk_ids``).
 
 MiniMax-M3 TP4 on MI355X, HIP-graph replay, 100 different inputs per graph
-(us per layer, aiter CK a16w4 in brackets): M=4 26.5 (42.4), M=8 44.3 (60.2),
-M=12 56.8 (74.8), M=16 69.1 (89.4).
+(us per layer, aiter production path in brackets: CK a16w4 below 256 tokens,
+FlyDSL a4w4 with fp4 activations at 256): M=4 26.5 (42.4), M=8 44.3 (60.2),
+M=12 56.8 (74.8), M=16 69.1 (89.4), M=32 104.8 (121.5), M=64 137.8 (153.3),
+M=128 161.7 (181.0), M=256 181.6 (200.3). bf16 activations throughout (cos
+0.99999 to the float reference; aiter's fp4-activation path at 256 is 0.97).
 """
 
 from __future__ import annotations
@@ -47,9 +56,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# One m-block per routing pair holds every token of the batch: M <= TILE_M.
+# One m-block per routing pair holds every token of the batch: M <= TILE_M
+# takes the sort-free path, larger batches the sorted one.
 TILE_M = 16
-MAX_DECODE_TOKENS = TILE_M
+MAX_PAIRS_TOKENS = TILE_M
+MAX_DECODE_TOKENS = 256
+# gemm2 split-K: worth ~1.5 us of latency hiding at small M, costs ~5 us of
+# extra atomics at M=256 (same-GPU sweeps at 32/64 vs 128/256).
+GEMM2_KSPLIT_SMALL_M = 64
 
 # Best configuration from the FlyDSL sweep (see the module docstring).
 GEMM1_CFG = dict(
@@ -103,17 +117,29 @@ def supports_batch(x: torch.Tensor) -> bool:
 
 
 def _intermediate_workspace(
-    device: torch.device, topk: int, intermediate_size: int
+    device: torch.device, topk: int, intermediate_size: int, num_experts: int
 ) -> torch.Tensor:
-    """gemm1 output by pair: ``[MAX_DECODE_TOKENS * topk * TILE_M, I]`` bf16.
-
-    Allocated once per (device, topk, I) so HIP-graph capture records no
-    allocation; gemm2 reads it back at rows ``pair * TILE_M + row``.
+    """gemm1 output, bf16 ``[rows, I]``: by pair (``pair * TILE_M + row``) on the
+    sort-free path, by sorted row on the sorted one; sized for the larger of
+    the two at ``MAX_DECODE_TOKENS`` and allocated once per (device, topk, I,
+    E) so HIP-graph capture records no allocation.
     """
-    key = (device.index if device.index is not None else -1, topk, intermediate_size)
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
+        max_sorted_rows,
+    )
+
+    key = (
+        device.index if device.index is not None else -1,
+        topk,
+        intermediate_size,
+        num_experts,
+    )
     ws = _workspaces.get(key)
     if ws is None:
-        rows = MAX_DECODE_TOKENS * topk * TILE_M
+        rows = max(
+            MAX_PAIRS_TOKENS * topk * TILE_M,
+            max_sorted_rows(MAX_DECODE_TOKENS, num_experts, topk, TILE_M),
+        )
         ws = torch.empty((rows, intermediate_size), dtype=torch.bfloat16, device=device)
         _workspaces[key] = ws
     return ws
@@ -136,7 +162,7 @@ def a16w4_decode_moe(
     w13_layout: str = "standard",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One MoE layer for ``M <= 16`` tokens on the sort-free FlyDSL kernels.
+    """One MoE layer for ``M <= 256`` tokens on the FlyDSL kernels.
 
     ``w13``/``w2`` and their e8m0 scales are the tensors the aiter MXFP4 backend
     stores on the layer; only their data pointers are used. ``w13_layout`` is
@@ -158,10 +184,28 @@ def a16w4_decode_moe(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.to(torch.float32).contiguous()
 
-    inter = _intermediate_workspace(x.device, topk, intermediate_size)
+    inter = _intermediate_workspace(x.device, topk, intermediate_size, num_experts)
     if out is None:
         out = torch.empty(
             (n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
+        )
+    if n_tokens > MAX_PAIRS_TOKENS:
+        return _sorted_decode_moe(
+            x,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            inter,
+            out,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            w13_layout=w13_layout,
         )
     # gemm1 zeroes `out` (its pair-0 blocks) before gemm2's atomics.
     a16w4_gemm1(
@@ -196,6 +240,77 @@ def a16w4_decode_moe(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         **GEMM2_CFG,
+    )
+    return out
+
+
+def _sorted_decode_moe(
+    x,
+    w13,
+    w13_scale,
+    w2,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    inter,
+    out,
+    *,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    swiglu_alpha,
+    swiglu_limit,
+    w13_layout,
+):
+    """``16 < M <= 256``: sort_decode (sort + zero `out`) -> gemm1 -> gemm2 on
+    expert-sorted rows (aiter ``moe_sorting`` contract, TILE_M-row blocks)."""
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.host import (
+        a16w4_gemm1,
+        a16w4_gemm2,
+    )
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
+        moe_sort_decode,
+    )
+
+    n_tokens, topk = topk_ids.shape
+    sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sort_decode(
+        topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out=out
+    )
+    a16w4_gemm1(
+        x_bf16=x,
+        w1_u8=w13,
+        w1_scale_u8=w13_scale,
+        sorted_expert_ids=sorted_eids,
+        num_valid_ids=num_valid,
+        sorted_token_ids=sorted_ids,
+        inter_sorted_bf16=inter,
+        n_tokens=n_tokens,
+        NE=num_experts,
+        D_HIDDEN=hidden_size,
+        D_INTER=intermediate_size,
+        topk=topk,
+        alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        w_layout=w13_layout,
+        **GEMM1_CFG,
+    )
+    cfg2 = dict(GEMM2_CFG)
+    if n_tokens > GEMM2_KSPLIT_SMALL_M:
+        cfg2["ksplit"] = 1
+    a16w4_gemm2(
+        inter_sorted_bf16=inter,
+        w2_u8=w2,
+        w2_scale_u8=w2_scale,
+        sorted_expert_ids=sorted_eids,
+        num_valid_ids=num_valid,
+        sorted_token_ids=sorted_ids,
+        sorted_weights=sorted_w,
+        out_bf16=out,
+        n_tokens=n_tokens,
+        NE=num_experts,
+        D_HIDDEN=hidden_size,
+        D_INTER=intermediate_size,
+        **cfg2,
     )
     return out
 
@@ -244,7 +359,7 @@ def _unsupported_reason(layer) -> str | None:
 
 
 def install_decode_fast_path(experts, prefix: str = "") -> bool:
-    """Route ``M <= 16`` calls of a MiniMax-M3 MoE layer to the FlyDSL kernels.
+    """Route ``M <= 256`` calls of a MiniMax-M3 MoE layer to the FlyDSL kernels.
 
     ``experts`` is what ``FusedMoEFactory`` returned (a runner holding
     ``routed_experts``) or the RoutedExperts layer itself. Wraps the layer's
@@ -320,6 +435,7 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
 
 __all__ = [
     "MAX_DECODE_TOKENS",
+    "MAX_PAIRS_TOKENS",
     "TILE_M",
     "a16w4_decode_moe",
     "install_decode_fast_path",

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax-M3 sort-free FlyDSL decode MoE (gfx950, MXFP4 weights, bf16 x).
+"""MiniMax-M3 FlyDSL decode MoE (gfx950, MXFP4 weights, bf16 x, M <= 256).
 
 Weights are quantized and shuffled exactly like the two aiter MXFP4 backends
 do at load time (AITER_MXFP4_MXFP4: shuffle_weights + e8m0_shuffle, what the
@@ -160,8 +160,9 @@ def _run(layout_tensors, layout, x, topk_ids, topk_weights):
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16, 17, 32, 64, 128, 256])
 def test_decode_moe_matches_reference(m3_weights, layout, m):
+    """M <= 16: sort-free pairs path; 17..256: sort_decode + sorted GEMMs."""
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.flydsl.moe_common import GateMode
@@ -199,22 +200,24 @@ def test_decode_moe_matches_reference(m3_weights, layout, m):
     )
     torch.cuda.synchronize()
     assert out.shape == (m, HIDDEN) and out.dtype == torch.bfloat16
-    assert _cos(out, ref_aiter) > 0.999
     ref = _float_reference(x, raw, topk_ids, topk_weights)
     scale = ref.abs().max().item()
     assert _cos(out, ref) > 0.999
     assert (out.float() - ref).abs().max().item() < 0.02 * scale
-    # the aiter chain itself agrees with the float reference just as well
-    assert (ref_aiter.float() - ref).abs().max().item() < 0.02 * scale
+    if m < 256:
+        # below 256 tokens aiter keeps bf16 activations: it agrees with the
+        # float reference just as well (at 256 it quantizes x to fp4, cos ~0.97)
+        assert _cos(out, ref_aiter) > 0.999
+        assert (ref_aiter.float() - ref).abs().max().item() < 0.02 * scale
 
 
-def test_decode_moe_graph_replay(m3_weights):
+@pytest.mark.parametrize("m", [16, 256])
+def test_decode_moe_graph_replay(m3_weights, m):
     """HIP-graph capture with different routing per call (how vLLM runs it)."""
     _, layouts, _ = m3_weights
     tensors = layouts["standard"]
     torch.manual_seed(1)
     device = tensors[0].device
-    m = 16
     inputs = [
         (
             torch.randn((m, HIDDEN), dtype=torch.bfloat16, device=device),
