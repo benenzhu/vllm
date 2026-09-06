@@ -458,6 +458,16 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
+        # Sort-free FlyDSL decode MoE (gfx950, MXFP4 W4A16, <= 16 tokens); see
+        # vllm/models/minimax_m3/amd/ops/moe_a16w4_decode. Calls outside its
+        # gate (larger batches, unfused shared experts) stay on the aiter path.
+        if envs.VLLM_ROCM_USE_M3_FLYDSL_DECODE_MOE:
+            from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
+                install_decode_fast_path,
+            )
+
+            install_decode_fast_path(self.experts, prefix=f"{prefix}.experts")
+
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
