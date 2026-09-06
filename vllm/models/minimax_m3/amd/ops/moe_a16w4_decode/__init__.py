@@ -310,11 +310,11 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
     qm.apply = apply
     qm._m3_decode_fast_path = True
     logger.info_once(
-        "M3 FlyDSL decode MoE installed for %s (M <= %d, w13 layout %s)",
-        prefix or "experts",
+        "M3 FlyDSL decode MoE installed (M <= %d, w13 layout %s)",
         MAX_DECODE_TOKENS,
         w13_layout,
     )
+    logger.debug("M3 FlyDSL decode MoE installed for %s", prefix or "experts")
     return True
 
 
