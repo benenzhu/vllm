@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sort-free FlyDSL decode MoE for MiniMax-M3 MXFP4 (W4A16) on gfx950.
+"""Sort-free FlyDSL decode MoE for MiniMax-M3 MXFP4 weights on gfx950 (bf16 x).
 
-The aiter CK path runs four kernels per MoE layer at decode batch sizes
+The aiter CK path runs five kernels per MoE layer at decode batch sizes
 (sort, zero-fill, gate/up GEMM, activation, down GEMM). At M <= 16 tokens the
 whole layer is HBM-bound on the expert weights, so the launch and sync gaps
 between those kernels are a large share of the time. This package keeps two
@@ -22,9 +22,11 @@ gemm1's first blocks zero the output so gemm2 can accumulate atomically.
 Only used when every condition below holds; otherwise the layer keeps the
 aiter path untouched:
 
-* gfx950, Mxfp4MoEMethod with the AITER_MXFP4_BF16 backend (the weight
-  layout this kernel reads is exactly the ``shuffle_weight(is_guinterleave=True)``
-  one that backend produces);
+* gfx950 and an aiter MXFP4 CK MoE backend whose weight layout the kernels
+  read: ``AITER_MXFP4_MXFP4`` (Quark ``w_mxfp4_a_mxfp4`` checkpoints such as
+  amd/MiniMax-M3-MXFP4; ``shuffle_weights`` + ``e8m0_shuffle``, and aiter
+  itself runs bf16 activations below 256 tokens) or ``AITER_MXFP4_BF16``
+  (``shuffle_weight(is_guinterleave=True)`` + ``shuffle_scale``);
 * activation ``swigluoai_uninterleave`` with ``swiglu_beta`` unset or 1, no
   expert bias, no expert parallelism, ``apply_router_weight_on_input`` off;
 * hidden size a multiple of 256, per-partition intermediate size a multiple
@@ -60,7 +62,6 @@ GEMM1_CFG = dict(
     a_direct=True,
     prefetch=3,
     scale_share=True,
-    w_layout="guinterleave",
     act="swigluoai",
 )
 GEMM2_CFG = dict(
@@ -75,6 +76,13 @@ GEMM2_CFG = dict(
 )
 _GEMM2_K_UNIT = GEMM2_CFG["tile_k"] * GEMM2_CFG["ksplit"]
 _GEMM2_N_UNIT = GEMM2_CFG["tile_n"]
+
+# mxfp4 backend -> gemm1 weight layout (w2 and the scales are laid out the same
+# way by both backends: shuffle_weight(16, 16) and e8m0_shuffle).
+_BACKEND_W13_LAYOUT = {
+    "AITER_MXFP4_MXFP4": "standard",
+    "AITER_MXFP4_BF16": "guinterleave",
+}
 
 _workspaces: dict[tuple[int, int, int], torch.Tensor] = {}
 
@@ -125,15 +133,18 @@ def a16w4_decode_moe(
     num_experts: int,
     swiglu_alpha: float,
     swiglu_limit: float,
+    w13_layout: str = "standard",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One MoE layer for ``M <= 16`` tokens on the sort-free FlyDSL kernels.
 
-    ``w13``/``w2`` and their e8m0 scales are the tensors the AITER_MXFP4_BF16
-    backend stores on the layer (``shuffle_weight(..., is_guinterleave=True)``
-    and ``shuffle_scale``); only their data pointers are used. ``topk_ids`` and
-    ``topk_weights`` are ``[M, topk]`` and already include the fused shared
-    expert. Returns ``[M, hidden_size]`` bf16.
+    ``w13``/``w2`` and their e8m0 scales are the tensors the aiter MXFP4 backend
+    stores on the layer; only their data pointers are used. ``w13_layout`` is
+    ``"standard"`` for ``shuffle_weights`` + ``e8m0_shuffle`` (AITER_MXFP4_MXFP4)
+    or ``"guinterleave"`` for ``shuffle_weight(is_guinterleave=True)`` +
+    ``shuffle_scale`` (AITER_MXFP4_BF16). ``topk_ids`` and ``topk_weights`` are
+    ``[M, topk]`` and already include the fused shared expert. Returns
+    ``[M, hidden_size]`` bf16.
     """
     from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.host import (
         a16w4_gemm1,
@@ -168,6 +179,7 @@ def a16w4_decode_moe(
         zero_out=out,
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        w_layout=w13_layout,
         **GEMM1_CFG,
     )
     a16w4_gemm2(
@@ -188,20 +200,26 @@ def a16w4_decode_moe(
     return out
 
 
+def _backend_w13_layout(quant_method) -> str | None:
+    """gemm1 weight layout for the layer's mxfp4 backend, None if unsupported."""
+    backend = getattr(quant_method, "mxfp4_backend", None)
+    return _BACKEND_W13_LAYOUT.get(getattr(backend, "value", None))
+
+
 def _unsupported_reason(layer) -> str | None:
     """Static checks on a RoutedExperts layer; None when the fast path applies."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
-    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
     from vllm.platforms.rocm import on_gfx950
 
     if not on_gfx950():
         return "requires gfx950"
     qm = getattr(layer, "quant_method", None)
-    if not isinstance(qm, Mxfp4MoEMethod):
-        return f"quant method is {type(qm).__name__}, not Mxfp4MoEMethod"
-    if qm.mxfp4_backend != Mxfp4MoeBackend.AITER_MXFP4_BF16:
-        return f"mxfp4 backend is {qm.mxfp4_backend}, not AITER_MXFP4_BF16"
+    if _backend_w13_layout(qm) is None:
+        backend = getattr(qm, "mxfp4_backend", None)
+        return (
+            f"quant method {type(qm).__name__} (mxfp4 backend {backend}) is not "
+            "AITER_MXFP4_MXFP4 or AITER_MXFP4_BF16"
+        )
     if layer.activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         return f"activation is {layer.activation}"
     if layer.swiglu_alpha is None or layer.swiglu_limit is None:
@@ -252,6 +270,7 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
     inter = layer.moe_config.intermediate_size_per_partition
     alpha = float(layer.swiglu_alpha)
     limit = float(layer.swiglu_limit)
+    w13_layout = _backend_w13_layout(qm)
 
     def apply(
         layer,
@@ -285,14 +304,16 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
             num_experts=layer.w13_weight.shape[0],
             swiglu_alpha=alpha,
             swiglu_limit=limit,
+            w13_layout=w13_layout,
         )
 
     qm.apply = apply
     qm._m3_decode_fast_path = True
     logger.info_once(
-        "M3 FlyDSL decode MoE installed for %s (M <= %d)",
+        "M3 FlyDSL decode MoE installed for %s (M <= %d, w13 layout %s)",
         prefix or "experts",
         MAX_DECODE_TOKENS,
+        w13_layout,
     )
     return True
 

@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax-M3 sort-free FlyDSL decode MoE (gfx950, MXFP4 W4A16) vs aiter.
+"""MiniMax-M3 sort-free FlyDSL decode MoE (gfx950, MXFP4 weights, bf16 x).
 
-Weights are quantized and shuffled exactly like the AITER_MXFP4_BF16 mxfp4
-backend does at load time, routing mimics aiter's fused shared expert
-(4 distinct routed experts + expert 128, weights renormalized x2), and the
-output is compared with a float reference on the dequantized experts (the
-swiglu-OAI activation MiniMax-M3 is defined with: alpha 1.702, clamp 7, up+1)
-and with aiter's CK a16w4 chain on the gate/up-separated layout, which applies
-the same activation in its standalone swiglu kernel.
+Weights are quantized and shuffled exactly like the two aiter MXFP4 backends
+do at load time (AITER_MXFP4_MXFP4: shuffle_weights + e8m0_shuffle, what the
+Quark amd/MiniMax-M3-MXFP4 checkpoint gets; AITER_MXFP4_BF16:
+shuffle_weight(is_guinterleave=True) + shuffle_scale), routing mimics aiter's
+fused shared expert (4 distinct routed experts + expert 128, weights
+renormalized x2), and the output is compared with a float reference on the
+dequantized experts (the swiglu-OAI activation MiniMax-M3 is defined with:
+alpha 1.702, clamp 7, up+1) and with aiter's CK a16w4 chain on the
+gate/up-separated layout, which applies the same activation in its standalone
+swiglu kernel.
 """
 
 import pytest
@@ -27,10 +30,11 @@ pytestmark = [
 HIDDEN, INTER, NUM_ROUTED, TOPK = 6144, 768, 128, 4
 NUM_EXPERTS = NUM_ROUTED + 1
 SWIGLU_ALPHA, SWIGLU_LIMIT = 1.702, 7.0
+LAYOUTS = ["standard", "guinterleave"]
 
 
-def _quantize_like_aiter_backend(w13: torch.Tensor, w2: torch.Tensor):
-    """per-1x32 MXFP4 + the shuffles oracle/mxfp4.py applies for AITER_MXFP4_BF16."""
+def _quantize_like_aiter_backends(w13: torch.Tensor, w2: torch.Tensor):
+    """per-1x32 MXFP4 + the shuffles oracle/mxfp4.py applies per aiter backend."""
     from aiter import dtypes
     from aiter.ops.quant import per_1x32_f4_quant
     from aiter.ops.shuffle import (
@@ -39,8 +43,12 @@ def _quantize_like_aiter_backend(w13: torch.Tensor, w2: torch.Tensor):
         shuffle_weight,
         shuffle_weight_a16w4,
     )
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    from vllm._aiter_ops import rocm_aiter_ops
 
     e = w13.shape[0]
+    fp4 = torch.float4_e2m1fn_x2
     w13_q, w13_s = per_1x32_f4_quant(w13, quant_dtype=dtypes.fp4x2)
     w2_q, w2_s = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
     w13_q = w13_q.view(e, w13.shape[1], w13.shape[2] // 2)
@@ -48,19 +56,29 @@ def _quantize_like_aiter_backend(w13: torch.Tensor, w2: torch.Tensor):
     w13_s = w13_s.view(torch.uint8).view(e, w13.shape[1], w13.shape[2] // 32)
     w2_s = w2_s.view(torch.uint8).view(e, w2.shape[1], w2.shape[2] // 32)
     raw = (w13_q, w13_s, w2_q, w2_s)
-    w13_k = shuffle_weight(
-        w13_q.view(torch.float4_e2m1fn_x2), is_guinterleave=True, gate_up=True
+    layouts = {}
+    # AITER_MXFP4_MXFP4 (oracle/mxfp4.py): shuffle_weights + e8m0_shuffle
+    w13_k, w2_k = rocm_aiter_ops.shuffle_weights(w13_q.view(fp4), w2_q.view(fp4))
+    layouts["standard"] = (
+        w13_k,
+        e8m0_shuffle(w13_s.view(e * w13.shape[1], -1)).view(e, w13.shape[1], -1),
+        w2_k,
+        e8m0_shuffle(w2_s.view(e * w2.shape[1], -1)).view(e, w2.shape[1], -1),
     )
-    w13_sk = shuffle_scale(w13_s.reshape(-1, w13_s.shape[-1]), e, True, True)
-    w2_k = shuffle_weight(
-        w2_q.view(torch.float4_e2m1fn_x2), is_guinterleave=True, gate_up=False
+    # AITER_MXFP4_BF16: gate/up interleaved w13, shuffle_scale
+    layouts["guinterleave"] = (
+        shuffle_weight(w13_q.view(fp4), is_guinterleave=True, gate_up=True),
+        shuffle_scale(w13_s.reshape(-1, w13_s.shape[-1]), e, True, True),
+        shuffle_weight(w2_q.view(fp4), is_guinterleave=True, gate_up=False),
+        shuffle_scale(w2_s.reshape(-1, w2_s.shape[-1]), e, True, False),
     )
-    w2_sk = shuffle_scale(w2_s.reshape(-1, w2_s.shape[-1]), e, True, False)
     # gate/up-separated w13 for aiter's split CK chain (sort, fill, gemm1,
-    # swiglu-OAI, gemm2); w2 and its scale are shared with the layout above.
-    w13_sep = shuffle_weight_a16w4(w13_q.view(torch.float4_e2m1fn_x2), 16, False)
-    w13_sep_s = shuffle_scale_a16w4(w13_s.reshape(-1, w13_s.shape[-1]), e, False)
-    return raw, (w13_k, w13_sk, w2_k, w2_sk), (w13_sep, w13_sep_s)
+    # swiglu-OAI, gemm2); w2 and its scale are shared with the layouts above.
+    sep = (
+        shuffle_weight_a16w4(w13_q.view(fp4), 16, False),
+        shuffle_scale_a16w4(w13_s.reshape(-1, w13_s.shape[-1]), e, False),
+    )
+    return raw, layouts, sep
 
 
 def _routing(m: int, device):
@@ -94,16 +112,13 @@ def _float_reference(x, raw, topk_ids, topk_weights):
         for j in range(topk_ids.shape[1]):
             e = int(topk_ids[t, j])
             h = xf[t] @ _dequant(w13_q[e], w13_s[e], HIDDEN).T
-            g, u = (
-                h[:INTER].clamp(max=SWIGLU_LIMIT),
-                h[INTER:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT),
-            )
+            g = h[:INTER].clamp(max=SWIGLU_LIMIT)
+            u = h[INTER:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
             a = g * torch.sigmoid(SWIGLU_ALPHA * g) * (u + 1.0)
             # the kernels round the stage-1 intermediate to bf16
             a = a.to(torch.bfloat16).float()
-            out[t] += float(topk_weights[t, j]) * (
-                a @ _dequant(w2_q[e], w2_s[e], INTER).T
-            )
+            w2e = _dequant(w2_q[e], w2_s[e], INTER)
+            out[t] += float(topk_weights[t, j]) * (a @ w2e.T)
     return out
 
 
@@ -116,41 +131,18 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 def m3_weights():
     torch.manual_seed(0)
     device = torch.device("cuda")
-    w13 = (
-        torch.randn(
-            (NUM_EXPERTS, 2 * INTER, HIDDEN), dtype=torch.bfloat16, device=device
-        )
-        * 0.02
+    w13 = torch.randn(
+        (NUM_EXPERTS, 2 * INTER, HIDDEN), dtype=torch.bfloat16, device=device
     )
-    w2 = (
-        torch.randn((NUM_EXPERTS, HIDDEN, INTER), dtype=torch.bfloat16, device=device)
-        * 0.02
-    )
-    return _quantize_like_aiter_backend(w13, w2)
+    w2 = torch.randn((NUM_EXPERTS, HIDDEN, INTER), dtype=torch.bfloat16, device=device)
+    return _quantize_like_aiter_backends(w13 * 0.02, w2 * 0.02)
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16])
-def test_decode_moe_matches_aiter(m3_weights, m):
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.flydsl.moe_common import GateMode
+def _run(layout_tensors, layout, x, topk_ids, topk_weights):
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import a16w4_decode_moe
 
-    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
-        MAX_DECODE_TOKENS,
-        a16w4_decode_moe,
-        supports_batch,
-        supports_shapes,
-    )
-
-    assert supports_shapes(HIDDEN, INTER)
-    raw, (w13_k, w13_sk, w2_k, w2_sk), (w13_sep, w13_sep_s) = m3_weights
-    torch.manual_seed(m)
-    device = w13_k.device
-    x = torch.randn((m, HIDDEN), dtype=torch.bfloat16, device=device)
-    topk_ids, topk_weights = _routing(m, device)
-    assert supports_batch(x) and m <= MAX_DECODE_TOKENS
-
-    out = a16w4_decode_moe(
+    w13_k, w13_sk, w2_k, w2_sk = layout_tensors
+    return a16w4_decode_moe(
         x,
         w13_k,
         w13_sk,
@@ -163,9 +155,35 @@ def test_decode_moe_matches_aiter(m3_weights, m):
         num_experts=NUM_EXPERTS,
         swiglu_alpha=SWIGLU_ALPHA,
         swiglu_limit=SWIGLU_LIMIT,
+        w13_layout=layout,
     )
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16])
+def test_decode_moe_matches_reference(m3_weights, layout, m):
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
+        MAX_DECODE_TOKENS,
+        supports_batch,
+        supports_shapes,
+    )
+
+    assert supports_shapes(HIDDEN, INTER)
+    raw, layouts, (w13_sep, w13_sep_s) = m3_weights
+    torch.manual_seed(m)
+    device = w13_sep.device
+    x = torch.randn((m, HIDDEN), dtype=torch.bfloat16, device=device)
+    topk_ids, topk_weights = _routing(m, device)
+    assert supports_batch(x) and m <= MAX_DECODE_TOKENS
+
+    out = _run(layouts[layout], layout, x, topk_ids, topk_weights)
     # aiter's split CK chain on the gate/up-separated layout (same experts,
     # same swiglu-OAI activation, independent implementation)
+    _, _, w2_k, w2_sk = layouts["standard"]
     ref_aiter = fused_moe(
         x,
         w13_sep,
@@ -192,11 +210,10 @@ def test_decode_moe_matches_aiter(m3_weights, m):
 
 def test_decode_moe_graph_replay(m3_weights):
     """HIP-graph capture with different routing per call (how vLLM runs it)."""
-    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import a16w4_decode_moe
-
-    raw, (w13_k, w13_sk, w2_k, w2_sk), _ = m3_weights
+    _, layouts, _ = m3_weights
+    tensors = layouts["standard"]
     torch.manual_seed(1)
-    device = w13_k.device
+    device = tensors[0].device
     m = 16
     inputs = [
         (
@@ -206,31 +223,15 @@ def test_decode_moe_graph_replay(m3_weights):
         for _ in range(4)
     ]
 
-    def run(x, topk_ids, topk_weights):
-        return a16w4_decode_moe(
-            x,
-            w13_k,
-            w13_sk,
-            w2_k,
-            w2_sk,
-            topk_weights,
-            topk_ids,
-            hidden_size=HIDDEN,
-            intermediate_size=INTER,
-            num_experts=NUM_EXPERTS,
-            swiglu_alpha=SWIGLU_ALPHA,
-            swiglu_limit=SWIGLU_LIMIT,
-        )
-
-    eager = [run(*inp).clone() for inp in inputs]
+    eager = [_run(tensors, "standard", *inp).clone() for inp in inputs]
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        run(*inputs[0])
+        _run(tensors, "standard", *inputs[0])
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        outs = [run(*inp) for inp in inputs]
+        outs = [_run(tensors, "standard", *inp) for inp in inputs]
     g.replay()
     g.replay()
     torch.cuda.synchronize()
