@@ -234,7 +234,10 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
     original aiter implementation unchanged. Returns True when installed.
     """
     layer = getattr(experts, "routed_experts", experts)
-    reason = _unsupported_reason(layer)
+    try:
+        reason = _unsupported_reason(layer)
+    except Exception as exc:  # a layer/config shape this gate does not know
+        reason = f"{type(exc).__name__}: {exc}"
     if reason is not None:
         logger.info_once(
             "M3 FlyDSL decode MoE not used for %s: %s", prefix or "experts", reason
