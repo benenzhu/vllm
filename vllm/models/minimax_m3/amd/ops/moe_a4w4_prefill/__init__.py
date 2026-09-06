@@ -39,7 +39,12 @@ aiter path untouched:
 * at call time: ``3072 <= M <= 32768`` contiguous bf16 tokens and no unfused
   shared experts. Below 3072 tokens aiter's small-batch configuration is
   faster (512: 205 vs 289 us, 2048: 316 vs 326); the decode package covers
-  ``M <= 256``.
+  ``M <= 256``;
+* the model runner has locked its shared workspace. The profile, warm-up and
+  graph-capture runs before that go to aiter, so the workspace it sizes on
+  the largest batch also fits the batches that stay on aiter afterwards
+  (``256 < M < 3072``; growth after the lock is an error). The chain is
+  compiled and its buffers exercised once during those runs.
 
 MiniMax-M3 TP4 on MI355X, one MoE layer, HIP-graph replay of 4 different
 inputs (us; aiter ``fused_moe`` in brackets): 4096 402 (473), 8192 614 (742),
@@ -92,6 +97,21 @@ def supports_batch(x: torch.Tensor) -> bool:
 
 def block_m_for(n_tokens: int) -> int:
     return 256 if n_tokens >= BM256_FROM_TOKENS else 128
+
+
+def _workspace_locked() -> bool:
+    """True once the model runner has locked its shared workspace (after
+    the profile, warm-up and cudagraph-capture runs), or when no runner owns
+    one (offline use, tests). While it is unlocked every batch must reach aiter
+    so the workspace grows to what the batches that stay on aiter will need."""
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not is_workspace_manager_initialized():
+        return True
+    return current_workspace_manager().is_locked()
 
 
 def _run_compiled(exe, *args):
@@ -322,6 +342,37 @@ def _unsupported_reason(layer) -> str | None:
     return None
 
 
+_warmed_block_sizes: set[int] = set()
+
+
+def _warm_up(layer, x, topk_weights, topk_ids, hidden: int, inter: int) -> None:
+    """Run the chain once per sort block size on a prefix of the profile
+    batch: compiles the kernels before the first real request and puts the
+    chain's buffers into the profiled activation peak."""
+    n_tokens = x.shape[0]
+    sizes = [n_tokens]
+    if block_m_for(n_tokens) != block_m_for(MIN_PREFILL_TOKENS):
+        sizes.append(MIN_PREFILL_TOKENS)
+    for m in sizes:
+        bm = block_m_for(m)
+        if bm in _warmed_block_sizes:
+            continue
+        _warmed_block_sizes.add(bm)
+        logger.debug("M3 FlyDSL prefill MoE warm-up: %d tokens, block %d", m, bm)
+        a4w4_prefill_moe(
+            x[:m],
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            topk_weights[:m],
+            topk_ids[:m],
+            hidden_size=hidden,
+            intermediate_size=inter,
+            num_experts=layer.w13_weight.shape[0],
+        )
+
+
 def install_prefill_fast_path(experts, prefix: str = "") -> bool:
     """Route ``MIN_PREFILL_TOKENS <= M <= MAX_PREFILL_TOKENS`` calls of a
     MiniMax-M3 MoE layer to the FlyDSL a4w4 chain.
@@ -360,6 +411,17 @@ def install_prefill_fast_path(experts, prefix: str = "") -> bool:
         **kwargs,
     ):
         if shared_experts is not None or kwargs or not supports_batch(x):
+            return orig_apply(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
+                shared_experts_input,
+                **kwargs,
+            )
+        if not _workspace_locked():
+            _warm_up(layer, x, topk_weights, topk_ids, hidden, inter)
             return orig_apply(
                 layer,
                 x,

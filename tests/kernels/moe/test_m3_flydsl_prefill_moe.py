@@ -225,3 +225,22 @@ def test_prefill_moe_gate():
             (MAX_PREFILL_TOKENS + 1, HIDDEN), dtype=torch.bfloat16, device="meta"
         )
     )
+
+
+def test_prefill_moe_defers_until_workspace_locked():
+    """The runner sizes the modular kernel's shared workspace during the
+    profile / warm-up / capture runs and locks it; the fast path must leave
+    those runs to aiter (a batch that stays on aiter later would otherwise
+    need a bigger workspace than the locked one)."""
+    from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import _workspace_locked
+    from vllm.v1.worker import workspace as ws
+
+    ws.reset_workspace_manager()
+    assert _workspace_locked()  # no runner: nothing to size
+    ws.init_workspace_manager(torch.device("cuda"))
+    try:
+        assert not _workspace_locked()
+        ws.lock_workspace()
+        assert _workspace_locked()
+    finally:
+        ws.reset_workspace_manager()
