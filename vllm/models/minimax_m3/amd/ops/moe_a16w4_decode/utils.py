@@ -21,11 +21,6 @@ def _raw(v):
     return v
 
 
-def s_waitcnt_lgkm0():
-    """``s_waitcnt lgkmcnt(0)`` (vmcnt/expcnt left at max); CDNA simm16 encoding."""
-    return rocdl.s_waitcnt(0xC07F)
-
-
 def _global_i32_buffer_view(addr_i64, num_bytes):
     """Buffer-tensor view of ``num_bytes`` i32 dwords at ``addr_i64`` (OOB-clamped)."""
     num_bytes_i64 = fx.Int64(num_bytes)
@@ -184,14 +179,6 @@ def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
     # AST rewriter turns into scf.if), so duplicate-expert blocks leave after the loads
     # and ballots without the two barriers.
     return e, owner, base, build_table
-
-
-def kmchunks_for(BM):
-    return BM // 16
-
-
-def lds_acc_bytes_for(rows, BN):
-    return rows * BN * 4
 
 
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16):

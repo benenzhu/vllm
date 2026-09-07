@@ -135,7 +135,6 @@ def a16w4_decode_moe(
     swiglu_alpha: float,
     swiglu_limit: float,
     w13_layout: str = "standard",
-    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One MoE layer for ``M <= 256`` tokens on the FlyDSL kernels.
 
@@ -163,10 +162,7 @@ def a16w4_decode_moe(
     topk_weights = topk_weights.to(torch.float32).contiguous()
 
     inter = _intermediate_workspace(x.device, topk, intermediate_size, num_experts)
-    if out is None:
-        out = torch.empty(
-            (n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
-        )
+    out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device)
     inline = n_tokens <= MAX_INLINE_SORT_TOKENS
     if inline:
         # no sort kernel: the GEMM blocks group the routing pairs themselves and

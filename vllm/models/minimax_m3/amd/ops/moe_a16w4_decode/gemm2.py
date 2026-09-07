@@ -40,7 +40,6 @@ from .utils import (
     _raw,
     inline_sort_max_pairs,
     inline_sort_table,
-    lds_acc_bytes_for,
 )
 
 BM = 16
@@ -139,11 +138,9 @@ def compile_gemm2(
     ksplit = KSPLIT_SMALL_M if n_tokens <= KSPLIT_SMALL_M_TOKENS else 1
     b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
-    assert K % TILE_K == 0 and K % 256 == 0 and TILE_K % 256 == 0
-    assert N_OUT % TILE_N == 0 and (TILE_N // 4) % 16 == 0
+    assert K % TILE_K == 0 and N_OUT % TILE_N == 0
     NNB = N_OUT // TILE_N
     KT_ALL = K // TILE_K
-    assert KT_ALL % ksplit == 0
     KT = KT_ALL // ksplit  # TILE_K tiles per CTA
     K0 = TILE_K // 128  # 128-K blocks per tile (one 1 KB W block, one scale byte)
     KH_TILE_BYTES = TILE_K * 2  # A bytes per row per tile
@@ -153,15 +150,13 @@ def compile_gemm2(
     TILE_K_DW = KH_TILE_BYTES // 4
     NLD = (BM * KH_TILE_BYTES) // (256 * 16)  # A copies per lane per tile
     A_BYTES = BM * KH_TILE_BYTES
-    LDS_BYTES = max(
-        A_BYTES, lds_acc_bytes_for(BM, TILE_N)
-    )  # epilogue reuses the A region
-    tab_off = LDS_BYTES  # inline sort: 32-entry routing table
+    LDS_BYTES = max(A_BYTES, BM * TILE_N * 4)  # epilogue reuses the A region
+    tab_off = LDS_BYTES  # 32-entry routing table (inline sort only; 128 B)
+    LDS_BYTES += 128
     if inline_sort:
         assert TOPK, "inline sort needs TOPK"
         assert n_tokens <= BM, "inline sort: every expert's rows fit one m-block"
         max_pairs = inline_sort_max_pairs(n_tokens, TOPK, BM)
-        LDS_BYTES += 128
     # W2 preshuffle layout as in gemm1: 16-col x 128-K blocks of 1 KB, lane*16 B inside
     W_BYTES = NE * N_OUT * (K // 2)
     SC_K1 = K // 256

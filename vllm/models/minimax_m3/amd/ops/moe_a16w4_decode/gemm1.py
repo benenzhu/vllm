@@ -78,8 +78,6 @@ def compile_gemm1(
     assert NPW % 16 == 0 and INTER % TILE_N == 0 and K % 256 == 0
     KT = K // 128  # 128-K tiles: 1 KB of W per 16 columns, 256 B of A per row
     KTW = KT // KW  # K-tiles per K-wave
-    assert KT % KW == 0 and KTW % KB == 0 and KTW % 2 == 0
-    assert 1 <= prefetch < KTW
     NNB = INTER // TILE_N
     ROWB = KB * 256  # A bytes per row per batch (per K-wave)
     RS = ROWB + LDS_PAD  # LDS row stride
@@ -103,18 +101,10 @@ def compile_gemm1(
     SW_BYTES = NE * N_OUT * (SC_K1 * 8)
     assert W_BYTES <= 0xFFFFFFFF, "buffer resources address 4 GB"
 
-    if inline_sort:
-
-        @fx.struct
-        class Shared:
-            a: fx.Array[fx.Uint8, LDS_BYTES, 16]  # A slots / K-reduce scratch
-            tab: fx.Array[fx.Int32, 32]  # routing table of this block
-
-    else:
-
-        @fx.struct
-        class Shared:
-            a: fx.Array[fx.Uint8, LDS_BYTES, 16]
+    @fx.struct
+    class Shared:
+        a: fx.Array[fx.Uint8, LDS_BYTES, 16]  # A slots / K-reduce scratch
+        tab: fx.Array[fx.Int32, 32]  # routing table (inline sort only; 128 B)
 
     name = (
         f"m3_gemm1_a16w4_h{K}_i{INTER}_ne{NE}_tn{TILE_N}_kw{KW}_kb{KB}_pf{prefetch}"

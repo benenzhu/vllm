@@ -69,7 +69,6 @@ def a16w4_gemm1(
     inline_sort=False,
     topk_ids=None,
     zero_out=None,
-    stream=None,
 ):
     """Stage 1: gate/up GEMM + swiglu-OAI -> bf16 ``[sorted rows, D_INTER]``."""
     launch = get_gemm1(
@@ -111,7 +110,7 @@ def a16w4_gemm1(
         inter_sorted_bf16.data_ptr(),
         int(zero_ptr),
         int(zero_dw),
-        torch.cuda.current_stream() if stream is None else stream,
+        torch.cuda.current_stream(),
     )
     return inter_sorted_bf16
 
@@ -134,7 +133,6 @@ def a16w4_gemm2(
     topk=None,
     topk_ids=None,
     topk_weights=None,
-    stream=None,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16``
     ``[n_tokens, D_HIDDEN]`` (zeroed beforehand)."""
@@ -169,6 +167,6 @@ def a16w4_gemm2(
         int(n_tokens),
         int(grid),
         out_bf16.data_ptr(),
-        torch.cuda.current_stream() if stream is None else stream,
+        torch.cuda.current_stream(),
     )
     return out_bf16
