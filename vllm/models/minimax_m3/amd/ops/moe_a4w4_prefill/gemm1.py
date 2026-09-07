@@ -637,11 +637,12 @@ def compile_moe_gemm1(
     """Grouped fp4 gemm1 for one (H, I, E, BLOCK_M). ``BLOCK_M`` must equal the
     ``moe_sorting`` block size the sorted inputs were built with (128 or 256).
 
-    Block order comes from a host-built int32 table
-    ``tile_map[remapped block] = m_tile << 3 | n_tile`` (-1 = nothing to do),
-    laid out expert by expert and n-slab-major inside an expert, so the 32 CUs
-    of one XCD chew through one expert with the same 768 KB gate/up slab of
-    W13 in L2 (see ``build_tile_map`` in bench_gemm1.py). The hardware deals
+    Block order comes from an int32 table built on the GPU by ``tile_map.py``
+    (one small kernel; ``tile_map[grid_size]`` holds the number of valid entries,
+    so no host sync): ``tile_map[remapped block] = m_tile << 3 | n_tile`` (-1 =
+    nothing to do), laid out expert by expert and n-slab-major inside an expert,
+    so the 32 CUs of one XCD chew through one expert with the same 768 KB
+    gate/up slab of W13 in L2. The hardware deals
     consecutive block ids round-robin over the 8 XCDs, so block id b is first
     remapped to ``(b % 8) * (grid / 8) + b // 8`` = a contiguous chunk of the
     table per XCD."""
