@@ -26,7 +26,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import range_constexpr
 
-from .utils import _global_f32_ptr, _global_i32_ptr, _lds_atomic_add_i32
+from .utils import _lds_atomic_add_i32
 
 
 def max_sorted_rows(n_tokens: int, E: int, topk: int, block_m: int) -> int:
@@ -63,24 +63,18 @@ def compile_decode_sort(
 
     @flyc.kernel(name=f"m3_decode_sort_zero_{tag}", known_block_size=[threads, 1, 1])
     def sort_zero(
-        arg_topk_ids: fx.Int64,
-        arg_topk_w: fx.Int64,
-        arg_sorted_ids: fx.Int64,
-        arg_sorted_w: fx.Int64,
-        arg_sorted_eids: fx.Int64,
-        arg_num_valid: fx.Int64,
-        arg_out: fx.Int64,
+        topk_ids: fx.Tensor,  # [n_tokens * topk] i32
+        topk_w: fx.Tensor,  # [n_tokens * topk] f32
+        sorted_ids: fx.Tensor,  # [max_sorted] i32
+        sorted_w: fx.Tensor,  # [max_sorted] f32
+        sorted_eids: fx.Tensor,  # [max_sorted / block_m] i32
+        num_valid: fx.Tensor,  # [2] i32
+        out_i32: fx.Tensor,  # out[n_tokens, H] bf16 viewed as i32 [n_tokens * H / 2]
         n_tok: fx.Int32,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx, bx = fx.thread_idx.x, fx.block_idx.x
         if bx == 0:
-            topk_ids = _global_i32_ptr(arg_topk_ids)
-            topk_w = _global_f32_ptr(arg_topk_w)
-            sorted_ids = _global_i32_ptr(arg_sorted_ids)
-            sorted_w = _global_f32_ptr(arg_sorted_w)
-            sorted_eids = _global_i32_ptr(arg_sorted_eids)
-            num_valid = _global_i32_ptr(arg_num_valid)
             count, cursor = smem.count.ptr, smem.cursor.ptr
             scan = [smem.scan.ptr, smem.scan.ptr + threads]
             n_pairs = n_tok * topk
@@ -134,7 +128,7 @@ def compile_decode_sort(
                     sorted_eids[fx.Int32(b)] = tx
                 for r in range(start + cnt, end):
                     sorted_ids[fx.Int32(r)] = n_tok  # padding: token n_tokens, slot 0
-                    sorted_w[fx.Int32(r)] = 0.0
+                    sorted_w[fx.Int32(r)] = fx.Float32(0.0)
             fx.gpu.barrier()
 
             # 5. place the pairs
@@ -145,13 +139,9 @@ def compile_decode_sort(
                     sorted_w[row] = w
         else:
             # blocks 1..zero_ctas: out[n_tokens, H] = 0, 16 B per store
-            # (a 16 B view + fx.copy: this flydsl has no vector-element pointer store)
-            out16 = fx.logical_divide(
-                fx.make_view(
-                    _global_i32_ptr(arg_out), fx.make_layout(n_tok * (H * 2 // 4), 1)
-                ),
-                fx.make_layout(4, 1),
-            )
+            # 16 B per store through a (4, n/4) view (no vector-element pointer store
+            # in this flydsl)
+            out16 = fx.logical_divide(out_i32, fx.make_layout(4, 1))
             atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
             zero_r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
             zero_r.store(fx.Vector.filled(4, 0, fx.Int32))
@@ -161,13 +151,13 @@ def compile_decode_sort(
 
     @flyc.jit
     def launch(
-        topk_ids: fx.Int64,
-        topk_w: fx.Int64,
-        sorted_ids: fx.Int64,
-        sorted_w: fx.Int64,
-        sorted_eids: fx.Int64,
-        num_valid: fx.Int64,
-        out: fx.Int64,
+        topk_ids: fx.Tensor,
+        topk_w: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        sorted_w: fx.Tensor,
+        sorted_eids: fx.Tensor,
+        num_valid: fx.Tensor,
+        out_i32: fx.Tensor,
         n_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -178,7 +168,7 @@ def compile_decode_sort(
             sorted_w,
             sorted_eids,
             num_valid,
-            out,
+            out_i32,
             n_tokens,
         ).launch(grid=(1 + zero_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
 
@@ -216,13 +206,13 @@ def moe_sort_decode(
         threads=threads,
     )
     launch(
-        topk_ids.contiguous().int().data_ptr(),
-        topk_weights.contiguous().float().data_ptr(),
-        sorted_ids.data_ptr(),
-        sorted_w.data_ptr(),
-        sorted_eids.data_ptr(),
-        num_valid.data_ptr(),
-        out.data_ptr(),
+        topk_ids.contiguous().int().view(-1),
+        topk_weights.contiguous().float().view(-1),
+        sorted_ids,
+        sorted_w,
+        sorted_eids,
+        num_valid,
+        out.view(torch.int32).view(-1),
         int(n_tokens),
         torch.cuda.current_stream(),
     )
