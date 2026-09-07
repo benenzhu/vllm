@@ -175,8 +175,8 @@ def a16w4_decode_moe(
     else:
         # expert-sorted rows in TILE_M-row blocks (aiter moe_sorting contract);
         # the sort kernel also zeroes `out`
-        sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sort_decode(
-            topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out=out
+        sorted_ids, sorted_w, sorted_eids, num_valid = moe_sort_decode(
+            topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out
         )
     a16w4_gemm1(
         x_bf16=x,

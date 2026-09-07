@@ -60,12 +60,35 @@ def _gep1(base_ptr, byte_off_i32):
     )
 
 
-def _global_i32_ptr(addr_i64):
-    """Typed global i32 pointer at a raw device address (``p[i]`` loads / stores)."""
+def _global_ptr(addr_i64, elem_ty, alignment):
     ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
+        elem_ty, address_space=fx.AddressSpace.Global, alignment=alignment
     )
     return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+
+
+def _global_i32_ptr(addr_i64):
+    """Typed global i32 pointer at a raw device address (``p[i]`` loads / stores)."""
+    return _global_ptr(addr_i64, T.i32, 4)
+
+
+def _global_f32_ptr(addr_i64):
+    return _global_ptr(addr_i64, T.f32, 4)
+
+
+def _lds_atomic_add_i32(ptr, value):
+    """``old = *ptr; *ptr += value`` on an LDS i32 pointer (workgroup scope);
+    returns ``old``. fx has no atomic wrapper, so this is the one raw LLVM op."""
+    return fx.Int32(
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.add,
+            ptr.llvm_ptr,
+            fx.Int32(value).ir_value(),
+            llvm.AtomicOrdering.monotonic,
+            syncscope="workgroup",
+            alignment=4,
+        ).result
+    )
 
 
 def _global_i32_at(addr_i64, idx):
