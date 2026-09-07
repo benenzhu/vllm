@@ -21,6 +21,7 @@ atomics. ``inline_sort``: routing without a sort kernel, as in gemm1.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
@@ -41,9 +42,6 @@ from .utils import (
     inline_sort_max_pairs,
     inline_sort_table,
     lds_acc_bytes_for,
-)
-from .utils import (
-    buffer_ops as bop,
 )
 
 BM = 16
@@ -313,10 +311,10 @@ def compile_gemm2(
                 )
                 return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)
 
-            wr = bop.create_buffer_resource_from_addr(
+            wr = buffer_ops.create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_bq)), num_records_bytes=W_BYTES
             )
-            sr = bop.create_buffer_resource_from_addr(
+            sr = buffer_ops.create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_bscale)), num_records_bytes=SW_BYTES
             )
             # W2 columns of this wave: block (expert_off + col)//16, this CTA's K range
@@ -344,7 +342,7 @@ def compile_gemm2(
             def load_w_tile(kt):
                 bb = [
                     [
-                        bop.buffer_load(
+                        buffer_ops.buffer_load(
                             wr,
                             wvo[ni] + fx.Int32(((kt * K0 + k0) % 4) * 256),
                             vec_width=4,
@@ -359,7 +357,7 @@ def compile_gemm2(
                 # one scale dword per 256 K: (kt*K0//2) dwords of 64 -> imm + SGPR
                 g2 = kt * K0 // 2
                 sc = [
-                    bop.buffer_load(
+                    buffer_ops.buffer_load(
                         sr,
                         svo[ni] + fx.Int32((g2 % 4) * 64),
                         vec_width=1,

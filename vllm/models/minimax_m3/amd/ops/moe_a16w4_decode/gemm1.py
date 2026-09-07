@@ -34,6 +34,7 @@ view of the shared struct and uses ``fx.copy``.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
@@ -44,9 +45,6 @@ from .utils import (
     _swigluoai_f32,
     inline_sort_max_pairs,
     inline_sort_table,
-)
-from .utils import (
-    buffer_ops as bop,
 )
 
 BM = 16  # rows per m-block (one MFMA M tile)
@@ -217,14 +215,16 @@ def compile_gemm1(
             ld_tok = mind_at(ld_row) & 0xFFFFFF
             # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
             ep_tok = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
-            xr = bop.create_buffer_resource_from_addr(
+            xr = buffer_ops.create_buffer_resource_from_addr(
                 arg_x, num_records_bytes=fx.Int64(i32_ntok) * (K * 2)
             )
-            wr = bop.create_buffer_resource_from_addr(arg_bq, num_records_bytes=W_BYTES)
-            sr = bop.create_buffer_resource_from_addr(
+            wr = buffer_ops.create_buffer_resource_from_addr(
+                arg_bq, num_records_bytes=W_BYTES
+            )
+            sr = buffer_ops.create_buffer_resource_from_addr(
                 arg_bscale, num_records_bytes=SW_BYTES
             )
-            outr = bop.create_buffer_resource_from_addr(
+            outr = buffer_ops.create_buffer_resource_from_addr(
                 arg_out, num_records_bytes=fx.Int64(cumsum0) * (INTER * 2)
             )
             ld_gdw = (ld_tok * (K * 2) + l16 * 16) // 4
@@ -238,7 +238,7 @@ def compile_gemm1(
                     so = _sconst((kw * KTW + b * KB) * 256)
                     out += [
                         fx.Vector(
-                            bop.buffer_load(
+                            buffer_ops.buffer_load(
                                 xr,
                                 ld_gdw + j * 64,
                                 vec_width=4,
@@ -332,7 +332,7 @@ def compile_gemm1(
                 bb = [
                     [
                         fx.Vector(
-                            bop.buffer_load(
+                            buffer_ops.buffer_load(
                                 wr,
                                 wvo[gu][ni] + (kt % 4) * 256,
                                 vec_width=4,
@@ -350,7 +350,7 @@ def compile_gemm1(
                     sc = [
                         [
                             fx.Int32(
-                                bop.buffer_load(
+                                buffer_ops.buffer_load(
                                     sr,
                                     svo[gu][ni] + ((kt // 2) % 4) * 64,
                                     vec_width=1,
@@ -474,7 +474,7 @@ def compile_gemm1(
                         u = acc[1][ni].load()[ii]
                         yb = _swigluoai_f32(g, u, f32_alpha, neg_limit).to(fx.BFloat16)
                         out_idx = sorted_row * INTER + nbase + ni * 16 + l16
-                        bop.buffer_store(yb, outr, out_idx, mask=valid)
+                        buffer_ops.buffer_store(yb, outr, out_idx, mask=valid)
 
             if const_expr(KW > 1):
                 if wave_k == 0:

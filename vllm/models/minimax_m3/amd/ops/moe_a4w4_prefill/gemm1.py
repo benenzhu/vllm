@@ -45,7 +45,7 @@ Layouts (all bytes):
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import (
-    buffer_ops as _buffer_ops,  # the copy shipped in the vLLM image
+    buffer_ops,  # the copy shipped in the vLLM image
 )
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
@@ -86,7 +86,7 @@ class _Buf:
         return fx.add_offset(self.base_ptr, self.byte_off)
 
 
-_gep = _buffer_ops.get_element_ptr
+_gep = buffer_ops.get_element_ptr
 
 
 def _lds_ptr_t():
@@ -426,12 +426,12 @@ class ScaleGatherMoE:
         self.wave_id = wave_id
         # aiter's buffer_ops returns the raw ROCDL resource (!llvm.ptr<8>) directly
         self.a_rsrc = fx.as_ir_value(
-            _buffer_ops.create_buffer_resource(
+            buffer_ops.create_buffer_resource(
                 a_scale, max_size=False, num_records_bytes=a_scale_bytes
             )
         )
         self.b_rsrc = fx.as_ir_value(
-            _buffer_ops.create_buffer_resource(
+            buffer_ops.create_buffer_resource(
                 b_scale, max_size=False, num_records_bytes=b_scale_bytes
             )
         )
@@ -713,10 +713,10 @@ def compile_moe_gemm1(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        ids_rsrc = _buffer_ops.create_buffer_resource(
+        ids_rsrc = buffer_ops.create_buffer_resource(
             sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BLOCK_M * 4)
         )
-        eid_rsrc = _buffer_ops.create_buffer_resource(
+        eid_rsrc = buffer_ops.create_buffer_resource(
             sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4
         )
         # The table's valid entries are [0, n_valid) with n_valid stored at
@@ -725,11 +725,11 @@ def compile_moe_gemm1(
         # last XCD(s) got only idle entries at every size (4096 tokens: 2 of 8
         # XCDs idle, 8192: 1.5, 32768: 0.35).
         intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
-        tm_rsrc = _buffer_ops.create_buffer_resource(
+        tm_rsrc = buffer_ops.create_buffer_resource(
             tile_map_t, max_size=False, num_records_bytes=(grid_size + 1) * 4
         )
         n_valid = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 tm_rsrc, grid_size, vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
@@ -737,7 +737,7 @@ def compile_moe_gemm1(
         remapped = xcd * per_xcd + intra_xcd
         in_chunk = (intra_xcd < per_xcd) & (remapped < n_valid)
         entry = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 tm_rsrc,
                 fx.arith.select(in_chunk, remapped, fx.Int32(0)),
                 vec_width=1,
@@ -750,7 +750,7 @@ def compile_moe_gemm1(
         block_valid = entry >= 0
         # ---- routing: this m-tile's expert ----
         expert = fx.Int32(
-            _buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32)
+            buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32)
         )
         m_base = tile_i * BLOCK_M
 
@@ -765,7 +765,7 @@ def compile_moe_gemm1(
                     row = lane_id // 8 + wave_id * 8 + rnd * (_N_WAVES * 8)
                     col = (lane_id % 8) * 16
                     sid = fx.Int32(
-                        _buffer_ops.buffer_load(
+                        buffer_ops.buffer_load(
                             ids_rsrc,
                             m_base + half * LDS_BLOCK_M + row,
                             vec_width=1,
@@ -834,10 +834,10 @@ def compile_moe_gemm1(
             def _gather_scale_thunks(k, slot):
                 return [lambda: scale_gather.gather(k, slot)]
 
-            a_rsrc = _buffer_ops.create_buffer_resource(
+            a_rsrc = buffer_ops.create_buffer_resource(
                 A, max_size=False, num_records_bytes=n_tokens * K_BYTES
             )
-            b_rsrc = _buffer_ops.create_buffer_resource(
+            b_rsrc = buffer_ops.create_buffer_resource(
                 W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES
             )
             a0_g2s = G2SLoaderAsm(a_rsrc, gl_off_a0, N_TILES_A, wave_id)
@@ -1148,12 +1148,12 @@ def compile_moe_gemm1(
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
 
             # ---- epilogue: swiglu-OAI + MXFP4 quant, sorted-row output ----
-            out_rsrc = _buffer_ops.create_buffer_resource(
+            out_rsrc = buffer_ops.create_buffer_resource(
                 OUT_Q,
                 max_size=False,
                 num_records_bytes=num_m_blocks * (BLOCK_M * I_BYTES),
             )
-            osc_rsrc = _buffer_ops.create_buffer_resource(
+            osc_rsrc = buffer_ops.create_buffer_resource(
                 OUT_scale,
                 max_size=False,
                 num_records_bytes=num_m_blocks * (BLOCK_M * SCALE_COLS_OUT),
@@ -1197,7 +1197,7 @@ def compile_moe_gemm1(
                         # after the swap lane group g holds tile (2p + g%2), cols
                         # (g//2)*8 .. +8
                         col = col_base + (2 * p + (g % 2)) * 16 + (g // 2) * 8
-                        _buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             dword,
                             out_rsrc,
                             row * I_BYTES + col // 2,
@@ -1210,7 +1210,7 @@ def compile_moe_gemm1(
                         blk = row32 * OUT_SC_BLOCKS_PER_ROW32 + colgrp // 8
                         pair = e8m0_of_ti[2 * tp] | (e8m0_of_ti[2 * tp + 1] << 8)
                         pair16 = _arith.TruncIOp(_T.i16, fx.as_ir_value(pair)).result
-                        _buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             pair16,
                             osc_rsrc,
                             blk * 256 + sc_in_block,

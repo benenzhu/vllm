@@ -19,7 +19,7 @@ binary searches over the (non-decreasing) expert ids, branch-free.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr import range_constexpr
 
 _THREADS = 256
@@ -41,25 +41,25 @@ def compile_tile_map(*, I: int, BM: int = 128):  # noqa: E741
         grid_entries: fx.Int32,
     ):
         tid = fx.thread_idx.x
-        nv_rsrc = _buffer_ops.create_buffer_resource(
+        nv_rsrc = buffer_ops.create_buffer_resource(
             num_valid_ids, max_size=False, num_records_bytes=4
         )
         num_valid = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
         vb = num_valid // fx.Int32(BM)  # valid blocks (num_valid is BM-padded)
-        eid_rsrc = _buffer_ops.create_buffer_resource(
+        eid_rsrc = buffer_ops.create_buffer_resource(
             sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4
         )
-        tm_rsrc = _buffer_ops.create_buffer_resource(
+        tm_rsrc = buffer_ops.create_buffer_resource(
             tile_map, max_size=False, num_records_bytes=(grid_entries + 1) * 4
         )
 
         def _eid(i):
             return fx.Int32(
-                _buffer_ops.buffer_load(eid_rsrc, i, vec_width=1, dtype=fx.Int32)
+                buffer_ops.buffer_load(eid_rsrc, i, vec_width=1, dtype=fx.Int32)
             )
 
         def _bound(e, upper):
@@ -87,16 +87,16 @@ def compile_tile_map(*, I: int, BM: int = 128):  # noqa: E741
                 cnt = hi - lo
                 base = lo * fx.Int32(NB_N) + (m - lo)
                 for n in range_constexpr(NB_N):
-                    _buffer_ops.buffer_store(
+                    buffer_ops.buffer_store(
                         (m << 3) | fx.Int32(n), tm_rsrc, base + cnt * fx.Int32(n)
                     )
         tail0 = vb * fx.Int32(NB_N)
         for it in range_constexpr(TAIL_ITERS):
             i = tail0 + tid + fx.Int32(it * _THREADS)
             if i < grid_entries:
-                _buffer_ops.buffer_store(fx.Int32(-1), tm_rsrc, i)
+                buffer_ops.buffer_store(fx.Int32(-1), tm_rsrc, i)
         if tid == fx.Int32(0):
-            _buffer_ops.buffer_store(tail0, tm_rsrc, grid_entries)
+            buffer_ops.buffer_store(tail0, tm_rsrc, grid_entries)
 
     @flyc.jit
     def launch_tile_map(

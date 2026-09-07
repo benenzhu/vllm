@@ -50,7 +50,7 @@ Layouts (bytes):
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
@@ -456,11 +456,11 @@ def compile_moe_gemm2(
         r16 = lane_id % 16
 
         # ---- work item: (m-tile, n-chunk); consecutive m-tiles share an XCD ----
-        nv_rsrc = _buffer_ops.create_buffer_resource(
+        nv_rsrc = buffer_ops.create_buffer_resource(
             num_valid_ids, max_size=False, num_records_bytes=4
         )
         num_valid = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
@@ -472,11 +472,11 @@ def compile_moe_gemm2(
         work_safe = fx.arith.select(block_valid, work, fx.Int32(0))
         tile_i, chunk = _divmod_nonneg(work_safe, n_split)
         m_base = tile_i * BM
-        eid_rsrc = _buffer_ops.create_buffer_resource(
+        eid_rsrc = buffer_ops.create_buffer_resource(
             sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4
         )
         expert = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 eid_rsrc,
                 tile_i >> EID_SHIFT,
                 vec_width=1,
@@ -487,11 +487,11 @@ def compile_moe_gemm2(
         if const_expr(EID_SHIFT > 0):
             # a 256-sort pads each expert to 256 rows: a 128-row tile whose first
             # row is the sentinel (tok == n_tokens) holds nothing to compute
-            ids_pre = _buffer_ops.create_buffer_resource(
+            ids_pre = buffer_ops.create_buffer_resource(
                 sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BM * 4)
             )
             first_sid = fx.Int32(
-                _buffer_ops.buffer_load(
+                buffer_ops.buffer_load(
                     ids_pre, m_base, vec_width=1, dtype=fx.Int32, is_scalar=True
                 )
             )
@@ -513,7 +513,7 @@ def compile_moe_gemm2(
         _lo_ok = tile_i >= _d
         _hi_ok = tile_i + _d < num_m_blocks
         _e_lo = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 eid_rsrc,
                 fx.arith.select(_lo_ok, tile_i - _d, fx.Int32(0)) >> EID_SHIFT,
                 vec_width=1,
@@ -522,7 +522,7 @@ def compile_moe_gemm2(
             )
         )
         _e_hi = fx.Int32(
-            _buffer_ops.buffer_load(
+            buffer_ops.buffer_load(
                 eid_rsrc,
                 fx.arith.select(_hi_ok, tile_i + _d, fx.Int32(0)) >> EID_SHIFT,
                 vec_width=1,
@@ -541,24 +541,24 @@ def compile_moe_gemm2(
             return fx.arith.select(x >= fx.Int32(NT), x - fx.Int32(NT), x)
 
         if block_valid:
-            ids_rsrc = _buffer_ops.create_buffer_resource(
+            ids_rsrc = buffer_ops.create_buffer_resource(
                 sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BM * 4)
             )
-            sw_rsrc = _buffer_ops.create_buffer_resource(
+            sw_rsrc = buffer_ops.create_buffer_resource(
                 sorted_weights,
                 max_size=False,
                 num_records_bytes=num_m_blocks * (BM * 4),
             )
-            a_rsrc = _buffer_ops.create_buffer_resource(
+            a_rsrc = buffer_ops.create_buffer_resource(
                 A, max_size=False, num_records_bytes=num_m_blocks * (BM * K_BYTES)
             )
-            as_rsrc = _buffer_ops.create_buffer_resource(
+            as_rsrc = buffer_ops.create_buffer_resource(
                 A_scale, max_size=False, num_records_bytes=num_m_blocks * (BM * SC_COLS)
             )
-            b_rsrc = _buffer_ops.create_buffer_resource(
+            b_rsrc = buffer_ops.create_buffer_resource(
                 W2, max_size=False, num_records_bytes=E * H * K_BYTES
             )
-            bs_rsrc = _buffer_ops.create_buffer_resource(
+            bs_rsrc = buffer_ops.create_buffer_resource(
                 W2_scale, max_size=False, num_records_bytes=E * H * SC_COLS
             )
 
@@ -736,10 +736,10 @@ def compile_moe_gemm2(
                 t()
 
             # ---- output rows (token-major) of the rows this lane touches ----
-            out_rsrc = _buffer_ops.create_buffer_resource(
+            out_rsrc = buffer_ops.create_buffer_resource(
                 OUT, max_size=False, num_records_bytes=n_tokens * (topk * OUT_ROW_BYTES)
             )
-            osc_rsrc = _buffer_ops.create_buffer_resource(
+            osc_rsrc = buffer_ops.create_buffer_resource(
                 OUT_scale,
                 max_size=False,
                 num_records_bytes=n_tokens * (topk * OUT_SC_COLS),
@@ -879,7 +879,7 @@ def compile_moe_gemm2(
                         row = lane_id // CH + ROWS_PER_ST * k
                         chunk = lane_id % CH
                         data = _lds_load_vec(_stg_addr(row, chunk, 0), 4)
-                        _buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             data,
                             out_rsrc,
                             out_off[h][k] + col_wave + chunk * 16,
@@ -894,7 +894,7 @@ def compile_moe_gemm2(
                     def _st_sc():
                         scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
                         sc_col = (chunk_n0 + _pn(nt)) * fx.Int32(BN // 32) + wave_j * 4
-                        _buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             scv,
                             osc_rsrc,
                             sc_off[h] + sc_col,
