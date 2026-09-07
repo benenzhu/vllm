@@ -76,11 +76,16 @@ def _gep1(base_ptr, byte_off_i32):
     )
 
 
-def _global_i32_at(addr_i64, idx):
+def _global_i32_ptr(addr_i64):
+    """Typed global i32 pointer at a raw device address (``p[i]`` loads / stores)."""
     ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))[idx]
+    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+
+
+def _global_i32_at(addr_i64, idx):
+    return _global_i32_ptr(addr_i64)[idx]
 
 
 def _e8m0_byte_to_f32(packed_i32, byte_pos):
@@ -104,15 +109,15 @@ def _swigluoai_f32(g, u, alpha, neg_limit):
     return g_c * sig * (u_c + fx.Float32(1.0))
 
 
-def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3, max_pairs=64):
+def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
     """Sort-free decode routing (n_tokens <= BM): build this block's sorted_token_ids
     table.
 
     Routing pair q = token*TOPK + slot (row-major topk_ids). Block p owns expert
     e = topk_ids[p] iff p is the FIRST pair with that expert; its rows are all pairs
     with expert e, in pair order (<= n_tokens <= BM rows, so one m-block per expert;
-    the shared expert is the block with n_tokens rows). The 32-entry table at
-    ``tab_ptr3`` (LDS) holds token | slot<<24 per row, token = n_tokens for padding
+    the shared expert is the block with n_tokens rows). The 32-entry table ``tab``
+    (an i32 LDS pointer) holds token | slot<<24 per row, token = n_tokens for padding
     rows, i.e. exactly what moe_sorting would have written for this block. Returns
     (expert id, owner, row count, build_table); non-owner blocks (duplicate experts)
     must exit. Pairs are scanned 64 per wave pass; ``max_pairs`` (BM*TOPK, 80 at
@@ -163,12 +168,10 @@ def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3, max_pair
 
     def build_table():
         # padding sentinel in every slot first (slots 0..31), then the rows
-        llvm.StoreOp(
-            _raw(i32_ntok), _gep3(tab_ptr3, (lane % fx.Int32(32)) * fx.Int32(4))
-        )
+        tab[lane % 32] = i32_ntok
         gpu.barrier()
         for c in range_constexpr(n_chunks):
-            llvm.StoreOp(_raw(fuseds[c]), _gep3(tab_ptr3, slots[c] * fx.Int32(4)))
+            tab[slots[c]] = fuseds[c]
         gpu.barrier()
 
     # The kernel calls build_table() under `if owner:` (a uniform branch the kernel's

@@ -202,7 +202,7 @@ def compile_gemm2(
         # routing of this block's rows, issued up front: expert id, token id (and
         # weight) per row for the epilogue and the pad mask
         if const_expr(pairs):
-            tab = _lds_ptr3(fx.Int32(fx.ptrtoint(smem)), fx.Int32(tab_off))
+            tab = fx.recast_iter(fx.Int32, smem + tab_off)
             e, owner, _, build_tab = decode_pairs_table(
                 arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs
             )
@@ -212,7 +212,7 @@ def compile_gemm2(
             go = owner
 
             def stid_at(row):  # token | slot<<24 for row of this block (LDS table)
-                return llvm.load(T.i32, _gep3(tab, row * fx.Int32(4)))
+                return tab[row]
 
             def sweight_at(row, fused):  # topk_weights[token*TOPK + slot], pads clamped
                 f = fx.Int32(fused)
