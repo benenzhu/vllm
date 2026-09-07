@@ -162,7 +162,7 @@ def _run(layout_tensors, layout, x, topk_ids, topk_weights):
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 12, 16, 17, 32, 64, 128, 256])
 def test_decode_moe_matches_reference(m3_weights, layout, m):
-    """M <= 16: sort-free pairs path; 17..256: sort_decode + sorted GEMMs."""
+    """M <= 16: inline-sort path; 17..256: sort_decode + sorted GEMMs."""
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.flydsl.moe_common import GateMode

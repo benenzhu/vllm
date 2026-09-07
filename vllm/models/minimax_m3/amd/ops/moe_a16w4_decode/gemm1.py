@@ -19,11 +19,12 @@ Two things the compiler needs here: a scheduling barrier after every K-tile
 and spills), and the K position of the loads in an opaque SGPR (``_sconst``;
 otherwise every uniform offset is folded into a per-tile vector address).
 
-Routing: ``pairs`` (n_tokens <= 16) derives the expert and rows of each block
-from ``topk_ids`` with a wave ballot (``utils.decode_pairs_table``) and the
-blocks of pair 0 zero the stage-2 output; otherwise the rows come expert-sorted
-from ``sort_decode``. Padding rows carry a token id >= n_tokens: their A loads
-read 0 through the OOB-clamped buffer resource and their outputs are masked.
+Routing: ``inline_sort`` (n_tokens <= 16) has no sort kernel: each block derives
+its expert and rows from ``topk_ids`` with a wave ballot
+(``utils.inline_sort_table``) and the blocks of routing pair 0 zero the stage-2
+output; otherwise the rows come expert-sorted from ``sort_decode``. Padding rows
+carry a token id >= n_tokens: their A loads read 0 through the OOB-clamped buffer
+resource and their outputs are masked.
 
 The global loads and the masked epilogue store go through ``buffer_ops`` (raw
 buffer instructions) because the layout copy API has no way to put the K
@@ -41,7 +42,8 @@ from .utils import (
     _global_i32_ptr,
     _sconst,
     _swigluoai_f32,
-    decode_pairs_table,
+    inline_sort_max_pairs,
+    inline_sort_table,
 )
 from .utils import (
     buffer_ops as bop,
@@ -62,12 +64,15 @@ def compile_gemm1(
     D_INTER,
     NE,
     TOPK,
-    large_m=False,
+    n_tokens,
     w_layout="standard",
-    pairs=False,
-    max_pairs=None,
+    inline_sort=False,
 ):
-    """Returns the launch function; ``launch.tile_n`` is the N tile for the grid."""
+    """Kernel for batches of up to ``n_tokens`` tokens: only the tile choice and the
+    inline-sort scan length depend on it, so different ``n_tokens`` often give the
+    same kernel (``launch.kernel_name``). ``launch.tile_n`` is the N tile for the
+    grid."""
+    large_m = n_tokens > LARGE_M_TOKENS
     TILE_N, KW, waves_per_eu = (64, 1, 3) if large_m else (32, 2, None)
     KB = 2  # 128-K tiles per A batch through LDS
     prefetch = 3  # W tiles in flight
@@ -92,9 +97,9 @@ def compile_gemm1(
     LDS_BYTES = max(2 * SLOT, RED_BYTES)
     # LDS is addressed in 16 B tiles below
     RS_T, KSLOT_T, SLOT_T = RS // 16, KSLOT // 16, SLOT // 16
-    if pairs:
-        max_pairs = int(max_pairs or BM * TOPK)
-        assert max_pairs <= BM * TOPK
+    if inline_sort:
+        assert n_tokens <= BM, "inline sort: every expert's rows fit one m-block"
+        max_pairs = inline_sort_max_pairs(n_tokens, TOPK, BM)
     # W (mxfp4) preshuffle layout (aiter make_preshuffle_b_layout, N-major, fp4 bytes):
     # (N_OUT/16, K/128, klane 4, nlane 16, kpack 16 B): one 16-col x 128-K block is 1 KB
     # contiguous; lane (klane, n) holds the 32 K of column n at klane -> lane*16 B.
@@ -105,7 +110,7 @@ def compile_gemm1(
     SC_STRIDE_N0 = SC_K1 * 64
     SW_BYTES = NE * N_OUT * (SC_K1 * 8)
 
-    if pairs:
+    if inline_sort:
 
         @fx.struct
         class Shared:
@@ -123,7 +128,7 @@ def compile_gemm1(
         f"_bcm{b_cache_mod}"
         + ("" if w_layout == "standard" else "_gu")
         + (f"_w{waves_per_eu}" if waves_per_eu else "")
-        + (f"_pairs{max_pairs}" if pairs else "")
+        + (f"_isort{max_pairs}" if inline_sort else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
@@ -169,10 +174,10 @@ def compile_gemm1(
             fx.copy(lds_atom, fx.slice(lds16, (None, tile)), r)
             return r.load()
 
-        if const_expr(pairs):
+        if const_expr(inline_sort):
             # block = routing pair mb: expert + rows from a ballot over the pairs
             tab = smem.tab.ptr
-            e_pair, owner, _nrows, build_tab = decode_pairs_table(
+            e_pair, owner, _nrows, build_tab = inline_sort_table(
                 arg_mind, i32_ntok, TOPK, mb, lane, tab, max_pairs=max_pairs
             )
             if owner:
@@ -198,7 +203,7 @@ def compile_gemm1(
                 return fx.Int32(mind[mbase + row])
 
         if go:
-            if const_expr(pairs):
+            if const_expr(inline_sort):
                 e = e_pair
             else:
                 e = fx.Int32(
@@ -516,5 +521,6 @@ def compile_gemm1(
             ),
         ).launch(grid=(grid_x, 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
+    launch.kernel_name = name
     launch.tile_n = TILE_N
     return launch

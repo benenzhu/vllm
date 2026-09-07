@@ -109,9 +109,16 @@ def _swigluoai_f32(g, u, alpha, neg_limit):
     return g_c * sig * (u_c + fx.Float32(1.0))
 
 
-def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
-    """Sort-free decode routing (n_tokens <= BM): build this block's sorted_token_ids
-    table.
+def inline_sort_max_pairs(n_tokens, topk, bm):
+    """Routing pairs the inline-sort table scans (64 per wave pass): one pass when
+    n_tokens*topk <= 64 (M <= 12 at topk 5), else the full bm*topk (80 -> two
+    passes). Compile-time (part of the kernel name)."""
+    return 64 if int(n_tokens) * int(topk) <= 64 else int(bm) * int(topk)
+
+
+def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
+    """Inline sort (n_tokens <= BM): no sort kernel; each block builds its own
+    sorted_token_ids table from ``topk_ids`` with a wave ballot.
 
     Routing pair q = token*TOPK + slot (row-major topk_ids). Block p owns expert
     e = topk_ids[p] iff p is the FIRST pair with that expert; its rows are all pairs

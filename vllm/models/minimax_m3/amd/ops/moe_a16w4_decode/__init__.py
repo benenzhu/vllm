@@ -15,11 +15,12 @@ keeps two FlyDSL GEMM kernels (plus one small sort kernel above 16 tokens):
 * ``gemm2``: down GEMM, split-K over 3 CTAs, routing-weighted bf16 atomic add
   into the (zeroed) output.
 
-At ``M <= 16`` neither needs ``moe_sorting``: every m-block is one routing
-pair ``(token, topk slot)`` and derives its expert id and its rows from
-``topk_ids`` with a wave ballot (``n_tokens <= TILE_M`` rows fit one block; the
-always-on shared expert owns all ``n_tokens`` rows, which pins ``TILE_M = 16``).
-gemm1's first blocks zero the output so gemm2 can accumulate atomically.
+At ``M <= 16`` the sort is inlined into the GEMMs (``inline_sort``): every
+m-block is one routing pair ``(token, topk slot)`` and derives its expert id and
+its rows from ``topk_ids`` with a wave ballot (``n_tokens <= TILE_M`` rows fit one
+block; the always-on shared expert owns all ``n_tokens`` rows, which pins
+``TILE_M = 16``). gemm1's first blocks zero the output so gemm2 can accumulate
+atomically.
 
 At ``16 < M <= 256`` the same GEMMs run on expert-sorted rows: ``sort_decode``
 (one launch: block 0 sorts the routing pairs by expert with LDS counters, the
@@ -59,9 +60,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # One m-block per routing pair holds every token of the batch: M <= TILE_M
-# takes the sort-free path, larger batches the sorted one.
+# takes the inline-sort path, larger batches the sorted one.
 TILE_M = 16
-MAX_PAIRS_TOKENS = TILE_M
+MAX_INLINE_SORT_TOKENS = TILE_M
 MAX_DECODE_TOKENS = 256
 
 # mxfp4 backend -> gemm1 weight layout (w2 and the scales are laid out the same
@@ -111,7 +112,7 @@ def _intermediate_workspace(
     ws = _workspaces.get(key)
     if ws is None:
         rows = max(
-            MAX_PAIRS_TOKENS * topk * TILE_M,
+            MAX_INLINE_SORT_TOKENS * topk * TILE_M,
             max_sorted_rows(MAX_DECODE_TOKENS, num_experts, topk, TILE_M),
         )
         ws = torch.empty((rows, intermediate_size), dtype=torch.bfloat16, device=device)
@@ -163,7 +164,7 @@ def a16w4_decode_moe(
         out = torch.empty(
             (n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
         )
-    if n_tokens > MAX_PAIRS_TOKENS:
+    if n_tokens > MAX_INLINE_SORT_TOKENS:
         return _sorted_decode_moe(
             x,
             w13,
@@ -192,7 +193,7 @@ def a16w4_decode_moe(
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
         topk=topk,
-        pairs=True,
+        inline_sort=True,
         topk_ids=topk_ids,
         zero_out=out,
         alpha=swiglu_alpha,
@@ -208,7 +209,7 @@ def a16w4_decode_moe(
         NE=num_experts,
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
-        pairs=True,
+        inline_sort=True,
         topk=topk,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -402,7 +403,7 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
 
 __all__ = [
     "MAX_DECODE_TOKENS",
-    "MAX_PAIRS_TOKENS",
+    "MAX_INLINE_SORT_TOKENS",
     "TILE_M",
     "a16w4_decode_moe",
     "install_decode_fast_path",

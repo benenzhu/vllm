@@ -16,7 +16,7 @@ pair-0 blocks); the ``ksplit`` CTAs of a tile sum their partials the same way.
 The expert id, token ids and routing weights are loaded with the first
 instructions so their latency hides under the K loop; padding rows point their
 A loads past the buffer's ``num_records`` (zero fill, no traffic) and skip the
-atomics. ``pairs``: sort-free routing as in gemm1.
+atomics. ``inline_sort``: routing without a sort kernel, as in gemm1.
 """
 
 import flydsl.compiler as flyc
@@ -38,7 +38,8 @@ from .utils import (
     _lds_ptr3,
     _raw,
     _sconst,
-    decode_pairs_table,
+    inline_sort_max_pairs,
+    inline_sort_table,
     lds_acc_bytes_for,
 )
 from .utils import (
@@ -129,15 +130,16 @@ def compile_gemm2(
     NE,
     N_OUT,
     D_INTER,
-    small_m=False,
-    pairs=False,
+    n_tokens,
+    inline_sort=False,
     TOPK=None,
-    max_pairs=None,
 ):
-    """N_OUT = hidden size (output columns), D_INTER = contraction. ``small_m``
-    selects split-K (``launch.ksplit`` CTAs per tile, each over D_INTER/ksplit);
-    ``pairs`` needs ``TOPK``. ``launch.tile_n`` is the N tile for the grid."""
-    ksplit = KSPLIT_SMALL_M if small_m else 1
+    """N_OUT = hidden size (output columns), D_INTER = contraction. Kernel for
+    batches of up to ``n_tokens`` tokens: that picks split-K (``launch.ksplit``
+    CTAs per tile, each over D_INTER/ksplit) and the inline-sort scan length
+    (``launch.kernel_name``); ``inline_sort`` needs ``TOPK``. ``launch.tile_n`` is
+    the N tile for the grid."""
+    ksplit = KSPLIT_SMALL_M if n_tokens <= KSPLIT_SMALL_M_TOKENS else 1
     b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
     assert K % TILE_K == 0 and K % 256 == 0 and TILE_K % 256 == 0
@@ -157,11 +159,11 @@ def compile_gemm2(
     LDS_BYTES = max(
         A_BYTES, lds_acc_bytes_for(BM, TILE_N)
     )  # epilogue reuses the A region
-    tab_off = LDS_BYTES  # pairs: 32-entry routing table
-    if pairs:
-        assert TOPK, "pairs needs TOPK"
-        max_pairs = int(max_pairs or BM * TOPK)
-        assert max_pairs <= BM * TOPK
+    tab_off = LDS_BYTES  # inline sort: 32-entry routing table
+    if inline_sort:
+        assert TOPK, "inline sort needs TOPK"
+        assert n_tokens <= BM, "inline sort: every expert's rows fit one m-block"
+        max_pairs = inline_sort_max_pairs(n_tokens, TOPK, BM)
         LDS_BYTES += 128
     # W2 preshuffle layout as in gemm1: 16-col x 128-K blocks of 1 KB, lane*16 B inside
     W_BYTES = NE * N_OUT * (K // 2)
@@ -177,7 +179,7 @@ def compile_gemm2(
 
     name = (
         f"m3_gemm2_a16w4_ne{NE}_h{N_OUT}_i{K}_tn{TILE_N}_tk{TILE_K}_ks{ksplit}_bcm{b_cache_mod}"
-        + (f"_pairs{max_pairs}" if pairs else "")
+        + (f"_isort{max_pairs}" if inline_sort else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
@@ -208,9 +210,9 @@ def compile_gemm2(
         sw_base = _global_base_ptr1(arg_sweights)
         # routing of this block's rows, issued up front: expert id, token id (and
         # weight) per row for the epilogue and the pad mask
-        if const_expr(pairs):
+        if const_expr(inline_sort):
             tab = fx.recast_iter(fx.Int32, smem + tab_off)
-            e, owner, _, build_tab = decode_pairs_table(
+            e, owner, _, build_tab = inline_sort_table(
                 arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs
             )
             if owner:
@@ -457,6 +459,7 @@ def compile_gemm2(
             arg_out,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
+    launch.kernel_name = name
     launch.tile_n = TILE_N
     launch.ksplit = ksplit
     return launch
