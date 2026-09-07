@@ -255,7 +255,6 @@ def a4w4_prefill_moe(
         h_s,
         bufs.sorted_ids,
         bufs.sorted_expert_ids,
-        bufs.num_valid_ids,
         n_tokens,
         num_m_blocks,
         int(a_s.numel() * a_s.element_size()),
