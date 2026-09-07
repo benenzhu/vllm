@@ -54,7 +54,6 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
@@ -71,7 +70,6 @@ from .gemm1 import (
     _Buf,
     _divmod_nonneg,
     _g2s_thunks,
-    _intrin_f32,
     _lds_ptr_t,
     _min,
     _permlane16_swap,
@@ -135,19 +133,10 @@ def _lds_store_vec(vec, addr_i32, n):
     _llvm.StoreOp(vec, _lds_ptr(addr_i32), alignment=4 * n)
 
 
-def _i1(v: bool):
-    t = _ir.IntegerType.get_signless(1)
-    return _arith.ConstantOp(t, _ir.IntegerAttr.get(t, 1 if v else 0)).result
-
-
 def _bf16x2(a, b):
     """two f32 -> one i32 of 2 bf16 (RNE, v_cvt_pk_bf16_f32: the same conversion as
     production's arith.truncf)"""
-    v2f32 = _ir.VectorType.get([2], _T.f32)
-    v2bf16 = _ir.VectorType.get([2], _ir.BF16Type.get())
-    v = _vector.FromElementsOp(v2f32, [fx.as_ir_value(a), fx.as_ir_value(b)]).result
-    t = _arith.TruncFOp(v2bf16, v).result
-    return fx.Int32(_llvm.bitcast(_T.i32, t))
+    return Vec.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
 
 
 def _cvt_pk_fp8(old, a, b, scale_f32, hi: bool):
@@ -163,7 +152,7 @@ def _cvt_pk_fp8(old, a, b, scale_f32, hi: bool):
             fx.as_ir_value(a),
             fx.as_ir_value(b),
             fx.as_ir_value(scale_f32),
-            _i1(hi),
+            fx.Boolean(hi).ir_value(),
         ],
         [],
         [],
@@ -175,11 +164,11 @@ def _e8m0_fp8(amax):
     """floor(log2 amax) - 7, floored at 0: amax / 2^(e-127) lands in [128, 256),
     inside e4m3 (max 448) with one bit of headroom, never saturates."""
     e = (_bits(amax) >> 23) - fx.Int32(7)
-    return fx.arith.select(e > fx.Int32(0), e, fx.Int32(0))
+    return (e > fx.Int32(0)).select(e, fx.Int32(0))
 
 
 def _fabs(v):
-    return _intrin_f32("llvm.fabs.f32", [v])
+    return fx.math.absf(v)
 
 
 def _maxf(a, b):
@@ -278,8 +267,7 @@ def _pin_vec4(v):
 
 
 def _v2i32(a, b):
-    ty = _ir.VectorType.get([2], _T.i32)
-    return _vector.FromElementsOp(ty, [fx.as_ir_value(a), fx.as_ir_value(b)]).result
+    return Vec.from_elements([a, b], fx.Int32).ir_value()
 
 
 class _BScaleGather:
@@ -451,7 +439,7 @@ def compile_moe_gemm2(
         intra, xcd = _divmod_nonneg(fx.block_idx.x, _NUM_XCDS)
         work = xcd * per_xcd + intra
         block_valid = (intra < per_xcd) & (work < n_work)
-        work_safe = fx.arith.select(block_valid, work, fx.Int32(0))
+        work_safe = block_valid.select(work, fx.Int32(0))
         tile_i, chunk = _divmod_nonneg(work_safe, n_split)
         m_base = tile_i * BM
         eid_rsrc = buffer_ops.create_buffer_resource(
@@ -497,7 +485,7 @@ def compile_moe_gemm2(
         _e_lo = fx.Int32(
             buffer_ops.buffer_load(
                 eid_rsrc,
-                fx.arith.select(_lo_ok, tile_i - _d, fx.Int32(0)) >> EID_SHIFT,
+                _lo_ok.select(tile_i - _d, fx.Int32(0)) >> EID_SHIFT,
                 vec_width=1,
                 dtype=fx.Int32,
                 is_scalar=True,
@@ -506,21 +494,21 @@ def compile_moe_gemm2(
         _e_hi = fx.Int32(
             buffer_ops.buffer_load(
                 eid_rsrc,
-                fx.arith.select(_hi_ok, tile_i + _d, fx.Int32(0)) >> EID_SHIFT,
+                _hi_ok.select(tile_i + _d, fx.Int32(0)) >> EID_SHIFT,
                 vec_width=1,
                 dtype=fx.Int32,
                 is_scalar=True,
             )
         )
         rot_on = (_lo_ok & (_e_lo == expert)) | (_hi_ok & (_e_hi == expert))
-        nt_rot = fx.arith.select(
-            rot_on, _divmod_nonneg(tile_i * fx.Int32(ROT_STRIDE), NT)[1], fx.Int32(0)
+        nt_rot = rot_on.select(
+            _divmod_nonneg(tile_i * fx.Int32(ROT_STRIDE), NT)[1], fx.Int32(0)
         )
 
         def _pn(nt):
             """CTA-local logical n-tile (sweep order) -> physical n-tile of the chunk"""
             x = nt + nt_rot
-            return fx.arith.select(x >= fx.Int32(NT), x - fx.Int32(NT), x)
+            return (x >= fx.Int32(NT)).select(x - fx.Int32(NT), x)
 
         if block_valid:
             ids_rsrc = buffer_ops.create_buffer_resource(
@@ -1070,12 +1058,7 @@ def compile_moe_gemm2(
                     )
                 return b0f, b1f, sc, accs[3]
 
-            zero_v4 = _arith.ConstantOp(
-                mfma.res_ty,
-                _ir.DenseElementsAttr.get_splat(
-                    mfma.res_ty, _ir.FloatAttr.get(_T.f32, 0.0)
-                ),
-            ).result
+            zero_v4 = Vec.filled(4, 0.0, fx.Float32).ir_value()  # accumulator zero
             init_state = _flat_state(
                 b0f, b1f, (_sc0[:2], _sc0[2:]), [zero_v4] * N_ACCUMS
             )

@@ -48,9 +48,7 @@ from aiter.ops.flydsl.kernels import (
     buffer_ops,  # the copy shipped in the vLLM image
 )
 from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
@@ -267,7 +265,7 @@ def _s2r_thunks(s2r, src, holder, n, pre):
 
 
 def _min(a, b):
-    return fx.arith.select(a < b, a, b)
+    return (a < b).select(a, b)
 
 
 def _divmod_nonneg(a, b):
@@ -454,11 +452,9 @@ class ScaleGatherMoE:
         q = wid % fx.Int32(2)
         g_a = a_base_row // fx.Int32(32) + q * fx.Int32(self._a_wave_groups)
         g_b = b_base_row // fx.Int32(32) + q * fx.Int32(self._b_wave_groups)
-        self._G = _uniform_i32(fx.arith.select(is_a, g_a, g_b))
+        self._G = _uniform_i32(is_a.select(g_a, g_b))
         self._HS = _uniform_i32(
-            fx.arith.select(
-                is_a, fx.Int32(self._a_half_groups), fx.Int32(self._b_half_groups)
-            )
+            is_a.select(fx.Int32(self._a_half_groups), fx.Int32(self._b_half_groups))
         )
         self._rsrc = fx.arith.select(is_a, self.a_rsrc, self.b_rsrc)
         self._soff0 = _uniform_i32(fx.Int32(0))
@@ -516,22 +512,12 @@ class ScaleLoaderLDS:
 
 
 # ── epilogue helpers ─────────────────────────────────────────────────────────
-def _f32(v):
-    return fx.Float32(v)
-
-
-def _intrin_f32(name, args):
-    return _f32(
-        _llvm.call_intrinsic(_T.f32, name, [fx.as_ir_value(a) for a in args], [], [])
-    )
-
-
 def _fmax(a, b):
-    return fx.arith.select(a > b, a, b)
+    return (a > b).select(a, b)
 
 
 def _fmin(a, b):
-    return fx.arith.select(a < b, a, b)
+    return (a < b).select(a, b)
 
 
 def _swiglu_oai(g, u):
@@ -539,22 +525,19 @@ def _swiglu_oai(g, u):
     mixed_moe_gemm_2stage ``swiglu_mul_vec4``): g clamped above, u clamped both
     sides, t = (g * alpha) * (-log2 e), sigmoid = rcp(1 + exp2(t)), g * sig * (u + 1).
     The two separate multiplies matter: folding the constant changes the last bit."""
-    lim = _f32(SWIGLU_LIMIT)
+    lim = fx.Float32(SWIGLU_LIMIT)
     g = _fmin(g, lim)
-    u = _fmax(_fmin(u, lim), _f32(-SWIGLU_LIMIT))
-    t = (g * _f32(SWIGLU_ALPHA)) * _f32(-1.4426950408889634)
-    e = _intrin_f32("llvm.amdgcn.exp2.f32", [t])
-    sig = _intrin_f32("llvm.amdgcn.rcp.f32", [_f32(1.0) + e])
-    return g * sig * (u + _f32(1.0))
+    u = _fmax(_fmin(u, lim), fx.Float32(-SWIGLU_LIMIT))
+    t = (g * fx.Float32(SWIGLU_ALPHA)) * fx.Float32(-1.4426950408889634)
+    e = fx.Float32(_rocdl.exp2(_T.f32, t.ir_value()))
+    sig = fx.Float32(_rocdl.rcp(_T.f32, (fx.Float32(1.0) + e).ir_value()))
+    return g * sig * (u + fx.Float32(1.0))
 
 
 def _round_bf16x2(a, b):
     """(a, b) -> the f32 values of their bf16 roundings (RNE, v_cvt_pk_bf16_f32):
     production stage 1 stores bf16 and quantises from it."""
-    v2f32 = _ir.VectorType.get([2], _T.f32)
-    v2bf16 = _ir.VectorType.get([2], _ir.BF16Type.get())
-    v = _vector.FromElementsOp(v2f32, [fx.as_ir_value(a), fx.as_ir_value(b)]).result
-    w = fx.Int32(_llvm.bitcast(_T.i32, _arith.TruncFOp(v2bf16, v).result))
+    w = Vec.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
     return _as_f32(w << 16), _as_f32(w & fx.Int32(-65536))
 
 
@@ -565,9 +548,9 @@ def _quant_prep_fp4(h8):
     for k in range_constexpr(0, 8, 2):
         lo, hi = _round_bf16x2(h8[k], h8[k + 1])
         hb += [lo, hi]
-    amax = _intrin_f32("llvm.fabs.f32", [hb[0]])
+    amax = fx.math.absf(hb[0])
     for v in range_constexpr(1, 8):
-        amax = _fmax(amax, _intrin_f32("llvm.fabs.f32", [hb[v]]))
+        amax = _fmax(amax, fx.math.absf(hb[v]))
     return hb, amax
 
 
@@ -575,37 +558,23 @@ def _e8m0_roundup_fp4(amax):
     """aiter's default MX scale rule (kDefaultMxScaleRoundMode = RoundUp):
     ceil_pow2(amax / 6) as a biased exponent (fp4 max = 6): the block's max lands in
     (3, 6]. Exponent 0xFF (NaN/Inf) is not bumped."""
-    u = _bits(amax * _f32(1.0 / 6.0))
+    u = _bits(amax * fx.Float32(1.0 / 6.0))
     e = (u >> 23) & fx.Int32(0xFF)
     bump = ((u & fx.Int32(0x7FFFFF)) != fx.Int32(0)) & (e < fx.Int32(0xFF))
-    return fx.arith.select(bump, e + fx.Int32(1), e)
+    return bump.select(e + fx.Int32(1), e)
 
 
 def _bits(f):
-    return fx.Int32(fx.arith.bitcast(_T.i32, fx.as_ir_value(f)))
+    return fx.Float32(f).bitcast(fx.Int32)
 
 
 def _as_f32(i):
-    return fx.Float32(fx.arith.bitcast(_T.f32, fx.as_ir_value(i)))
+    return fx.Int32(i).bitcast(fx.Float32)
 
 
 def _cvt_pk_fp4(old, a, b, scale_f32, sel):
     """v_cvt_scalef32_pk_fp4_f32: two f32 / 2^(e8m0-127) -> 2 fp4 into byte ``sel``."""
-    return fx.Int32(
-        _llvm.call_intrinsic(
-            _T.i32,
-            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
-            [
-                fx.as_ir_value(old),
-                fx.as_ir_value(a),
-                fx.as_ir_value(b),
-                fx.as_ir_value(scale_f32),
-                fx.as_ir_value(fx.Int32(sel)),
-            ],
-            [],
-            [],
-        )
-    )
+    return fx.Int32(_rocdl.cvt_scalef32_pk_fp4_f32(_T.i32, old, a, b, scale_f32, sel))
 
 
 def _permlane16_swap(d_a, d_b):
@@ -730,12 +699,12 @@ def compile_moe_gemm1(
         entry = fx.Int32(
             buffer_ops.buffer_load(
                 tm_rsrc,
-                fx.arith.select(in_chunk, remapped, fx.Int32(0)),
+                in_chunk.select(remapped, fx.Int32(0)),
                 vec_width=1,
                 dtype=fx.Int32,
             )
         )
-        entry = fx.arith.select(in_chunk, entry, fx.Int32(-1))
+        entry = in_chunk.select(entry, fx.Int32(-1))
         tile_i = entry >> 3
         tile_j = entry & 7
         block_valid = entry >= 0
@@ -1168,9 +1137,12 @@ def compile_moe_gemm1(
                         uv = Vec(c_up[mfma.idx(ti, 2 * p)])
                         uw = Vec(c_up[mfma.idx(ti, 2 * p + 1)])
                         h = [
-                            _swiglu_oai(_f32(gv[v]), _f32(uv[v]))
+                            _swiglu_oai(fx.Float32(gv[v]), fx.Float32(uv[v]))
                             for v in range_constexpr(4)
-                        ] + [_swiglu_oai(_f32(gw[v]), _f32(uw[v])) for v in range(4)]
+                        ] + [
+                            _swiglu_oai(fx.Float32(gw[v]), fx.Float32(uw[v]))
+                            for v in range(4)
+                        ]
                         h, amax = _quant_prep_fp4(h)
                         # the 4 lanes {L, L^16, L^32, L^48} hold the same row
                         amax = _fmax(amax, amax.shuffle_xor(16, 64))
@@ -1200,7 +1172,7 @@ def compile_moe_gemm1(
                         row32 = (base_row // 32) + tp
                         blk = row32 * OUT_SC_BLOCKS_PER_ROW32 + colgrp // 8
                         pair = e8m0_of_ti[2 * tp] | (e8m0_of_ti[2 * tp + 1] << 8)
-                        pair16 = _arith.TruncIOp(_T.i16, fx.as_ir_value(pair)).result
+                        pair16 = fx.Int32(pair).to(fx.Int16)
                         buffer_ops.buffer_store(
                             pair16,
                             osc_rsrc,
