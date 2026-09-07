@@ -14,11 +14,6 @@ with non-temporal loads (1 KB contiguous per wave instruction in aiter's
 preshuffled layout), the per-32 e8m0 scales come one packed dword per 256 K, and
 the fp4 -> bf16 conversion runs right before each MFMA.
 
-Two things the compiler needs here: a scheduling barrier after every K-tile
-(otherwise it hoists the conversions of the next tiles above the current MFMAs
-and spills), and the K position of the loads in an opaque SGPR (``_sconst``;
-otherwise every uniform offset is folded into a per-tile vector address).
-
 Routing: ``inline_sort`` (n_tokens <= 16) has no sort kernel: each block derives
 its expert and rows from ``topk_ids`` with a wave ballot
 (``utils.inline_sort_table``) and the blocks of routing pair 0 zero the stage-2
@@ -41,7 +36,6 @@ from flydsl.expr.typing import T
 from .utils import (
     _e8m0_byte_to_f32,
     _global_i32_ptr,
-    _sconst,
     _swigluoai_f32,
     inline_sort_max_pairs,
     inline_sort_table,
@@ -235,7 +229,7 @@ def compile_gemm1(
                 # j*256 in the immediate offset field
                 out = []
                 for kw in range_constexpr(KW):
-                    so = _sconst((kw * KTW + b * KB) * 256)
+                    so = (kw * KTW + b * KB) * 256
                     out += [
                         fx.Vector(
                             buffer_ops.buffer_load(
@@ -328,7 +322,7 @@ def compile_gemm1(
             ]
 
             def load_b_tile(kt, prev):
-                so = _sconst((kt // 4) * 4096)
+                so = (kt // 4) * 4096
                 bb = [
                     [
                         fx.Vector(
@@ -346,7 +340,7 @@ def compile_gemm1(
                     for gu in range_constexpr(2)
                 ]
                 if const_expr(kt % 2 == 0):
-                    sso = _sconst((kt // 8) * 1024)  # one scale dword per 2 K-tiles
+                    sso = (kt // 8) * 1024  # one scale dword per 2 K-tiles
                     sc = [
                         [
                             fx.Int32(
@@ -409,7 +403,7 @@ def compile_gemm1(
                             )
 
             # pipeline: batch 0 -> LDS, W ring; per tile: (batch loads) W load, LDS
-            # read, MFMAs, scheduling barrier
+            # read, MFMAs
             abuf = load_a_batch(0)
             ring = []
             for t in range_constexpr(prefetch):
@@ -423,7 +417,6 @@ def compile_gemm1(
                     ring.append(load_b_tile(kt + prefetch, ring[-1]))
                 bb, sc = ring.pop(0)
                 compute_tile(bb, sc, read_a_tile(kt), kt)
-                fx.rocdl.sched_barrier(0)
                 if const_expr(kt % KB == KB - 1 and kt + 1 < KTW):
                     stage_a_batch(
                         abuf, (kt // KB + 1) % 2

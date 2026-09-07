@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Low-level helpers shared by the decode gemm1 / gemm2 kernels: pointer builders,
-the opaque-SGPR constant, the swiglu-OAI activation, the e8m0 scale decode, the
-sort-free routing table and the A-LDS XOR swizzle."""
+the swiglu-OAI activation, the e8m0 scale decode, the inline-sort routing table
+and the A-LDS XOR swizzle."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -24,22 +24,6 @@ def _raw(v):
 def s_waitcnt_lgkm0():
     """``s_waitcnt lgkmcnt(0)`` (vmcnt/expcnt left at max); CDNA simm16 encoding."""
     return rocdl.s_waitcnt(0xC07F)
-
-
-def _sconst(v):
-    """An i32 constant in an SGPR behind an asm the backend cannot see through. Passed
-    as a buffer load's soffset it stays scalar; a plain constant (or uniform sum) there
-    gets folded into the vector address instead, one VGPR per 4 K-tiles per column tile
-    (66 address VGPRs for 240 loads in gemm1, spilling to AGPRs)."""
-    return fx.Int32(
-        llvm.inline_asm(
-            T.i32,
-            [_raw(fx.Int32(v))],
-            "s_mov_b32 $0, $1",
-            "=s,s",
-            has_side_effects=True,
-        )
-    )
 
 
 def _global_i32_buffer_view(addr_i64, num_bytes):

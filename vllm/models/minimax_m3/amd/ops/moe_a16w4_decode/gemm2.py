@@ -38,7 +38,6 @@ from .utils import (
     _global_i32_buffer_view,
     _lds_ptr3,
     _raw,
-    _sconst,
     inline_sort_max_pairs,
     inline_sort_table,
     lds_acc_bytes_for,
@@ -348,7 +347,7 @@ def compile_gemm2(
                             vec_width=4,
                             dtype=fx.Int32,
                             cache_modifier=b_cache_mod,
-                            soffset_bytes=_sconst(((kt * K0 + k0) // 4) * 4096),
+                            soffset_bytes=((kt * K0 + k0) // 4) * 4096,
                         )
                         for k0 in range_constexpr(K0)
                     ]
@@ -362,7 +361,7 @@ def compile_gemm2(
                         svo[ni] + fx.Int32((g2 % 4) * 64),
                         vec_width=1,
                         dtype=fx.Int32,
-                        soffset_bytes=_sconst((g2 // 4) * 1024),
+                        soffset_bytes=(g2 // 4) * 1024,
                     )
                     for ni in range_constexpr(NI)
                 ]
