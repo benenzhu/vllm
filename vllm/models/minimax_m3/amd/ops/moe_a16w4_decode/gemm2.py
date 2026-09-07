@@ -170,6 +170,7 @@ def compile_gemm2(
     SC_K1 = K // 256
     SC_STRIDE_N0 = SC_K1 * 64
     SW_BYTES = NE * N_OUT * (SC_K1 * 8)
+    assert W_BYTES <= 0xFFFFFFFF, "buffer resources address 4 GB"
     # padding rows: A loads pointed here (>= num_records 0xFFFFC000) read zeros
     A_OOB_DW = 0x3FFFF000
 
@@ -313,10 +314,10 @@ def compile_gemm2(
                 return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)
 
             wr = bop.create_buffer_resource_from_addr(
-                _raw(fx.Int64(arg_bq)), num_records_bytes=min(W_BYTES, 0xFFFFFFFF)
+                _raw(fx.Int64(arg_bq)), num_records_bytes=W_BYTES
             )
             sr = bop.create_buffer_resource_from_addr(
-                _raw(fx.Int64(arg_bscale)), num_records_bytes=min(SW_BYTES, 0xFFFFFFFF)
+                _raw(fx.Int64(arg_bscale)), num_records_bytes=SW_BYTES
             )
             # W2 columns of this wave: block (expert_off + col)//16, this CTA's K range
             # starts at 128-K block ks*KT*K0; per tile the block index goes in an SGPR

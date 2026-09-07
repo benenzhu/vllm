@@ -109,6 +109,7 @@ def compile_gemm1(
     SC_K1 = K // 256
     SC_STRIDE_N0 = SC_K1 * 64
     SW_BYTES = NE * N_OUT * (SC_K1 * 8)
+    assert W_BYTES <= 0xFFFFFFFF, "buffer resources address 4 GB"
 
     if inline_sort:
 
@@ -219,11 +220,9 @@ def compile_gemm1(
             xr = bop.create_buffer_resource_from_addr(
                 arg_x, num_records_bytes=fx.Int64(i32_ntok) * (K * 2)
             )
-            wr = bop.create_buffer_resource_from_addr(
-                arg_bq, num_records_bytes=min(W_BYTES, 0xFFFFFFFF)
-            )
+            wr = bop.create_buffer_resource_from_addr(arg_bq, num_records_bytes=W_BYTES)
             sr = bop.create_buffer_resource_from_addr(
-                arg_bscale, num_records_bytes=min(SW_BYTES, 0xFFFFFFFF)
+                arg_bscale, num_records_bytes=SW_BYTES
             )
             outr = bop.create_buffer_resource_from_addr(
                 arg_out, num_records_bytes=fx.Int64(cumsum0) * (INTER * 2)
