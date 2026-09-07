@@ -13,8 +13,8 @@ import functools
 import flydsl.compiler as flyc
 import torch
 
-from .gemm1 import BM, compile_gemm1
-from .gemm2 import compile_gemm2
+from .gemm1 import BM, LARGE_M_TOKENS, compile_gemm1
+from .gemm2 import KSPLIT_SMALL_M_TOKENS, compile_gemm2
 
 
 def _run_compiled(exe, *args):
@@ -54,12 +54,6 @@ def a16w4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
-    tile_n,
-    k_waves,
-    k_batch,
-    prefetch,
-    b_nt=2,
-    waves_per_eu=None,
     alpha=1.702,
     swiglu_limit=7.0,
     w_layout="standard",
@@ -77,13 +71,8 @@ def a16w4_gemm1(
         D_INTER=D_INTER,
         NE=NE,
         TOPK=topk,
-        TILE_N=tile_n,
-        k_waves=k_waves,
-        k_batch=k_batch,
-        prefetch=prefetch,
-        b_cache_mod=b_nt,
+        large_m=int(n_tokens) > LARGE_M_TOKENS,
         w_layout=w_layout,
-        waves_per_eu=waves_per_eu,
         pairs=pairs,
         max_pairs=_pairs_cap(n_tokens, topk) if pairs else None,
     )
@@ -101,7 +90,7 @@ def a16w4_gemm1(
             sorted_token_ids.data_ptr(),
         )
         zero_ptr, zero_dw = 0, 0
-    grid = max_m_blocks * (D_INTER // tile_n)
+    grid = max_m_blocks * (D_INTER // launch.tile_n)
     _run_compiled(
         launch,
         x_bf16.data_ptr(),
@@ -132,11 +121,6 @@ def a16w4_gemm2(
     NE,
     D_HIDDEN,
     D_INTER,
-    tile_n,
-    tile_k,
-    ksplit=1,
-    b_nt=2,
-    waves_per_eu=None,
     sorted_expert_ids=None,
     num_valid_ids=None,
     sorted_token_ids=None,
@@ -153,11 +137,7 @@ def a16w4_gemm2(
         NE=NE,
         N_OUT=D_HIDDEN,
         D_INTER=D_INTER,
-        TILE_N=tile_n,
-        TILE_K=tile_k,
-        ksplit=ksplit,
-        b_cache_mod=b_nt,
-        waves_per_eu=waves_per_eu,
+        small_m=int(n_tokens) <= KSPLIT_SMALL_M_TOKENS,
         pairs=pairs,
         TOPK=topk if pairs else None,
         max_pairs=_pairs_cap(n_tokens, topk) if pairs else None,
@@ -172,7 +152,7 @@ def a16w4_gemm2(
         max_m_blocks = int(sorted_expert_ids.numel())
         eids_ptr, cumsum_ptr = sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr()
         stids_ptr, sw_ptr = sorted_token_ids.data_ptr(), sorted_weights.data_ptr()
-    grid = max_m_blocks * (D_HIDDEN // tile_n) * ksplit
+    grid = max_m_blocks * (D_HIDDEN // launch.tile_n) * launch.ksplit
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),

@@ -115,22 +115,30 @@ def _atomic_bf16_epilog(
                 )
 
 
+# Tiles (MI355X sweeps): 256 output columns x 256 K per workgroup. Split-K 3 up to
+# KSPLIT_SMALL_M_TOKENS is worth ~1.5 us of latency hiding; at 256 tokens it costs
+# ~5 us of extra atomics, so larger batches run unsplit.
+TILE_N = 256
+TILE_K = 256
+KSPLIT_SMALL_M = 3
+KSPLIT_SMALL_M_TOKENS = 64
+
+
 def compile_gemm2(
     *,
     NE,
     N_OUT,
     D_INTER,
-    TILE_N=256,
-    TILE_K=256,
-    ksplit=1,
-    b_cache_mod=2,
-    waves_per_eu=None,
+    small_m=False,
     pairs=False,
     TOPK=None,
     max_pairs=None,
 ):
-    """N_OUT = hidden size (output columns), D_INTER = contraction. ``ksplit`` CTAs
-    per tile each cover D_INTER/ksplit; ``pairs`` needs ``TOPK``."""
+    """N_OUT = hidden size (output columns), D_INTER = contraction. ``small_m``
+    selects split-K (``launch.ksplit`` CTAs per tile, each over D_INTER/ksplit);
+    ``pairs`` needs ``TOPK``. ``launch.tile_n`` is the N tile for the grid."""
+    ksplit = KSPLIT_SMALL_M if small_m else 1
+    b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
     assert K % TILE_K == 0 and K % 256 == 0 and TILE_K % 256 == 0
     assert N_OUT % TILE_N == 0 and (TILE_N // 4) % 16 == 0
@@ -169,7 +177,6 @@ def compile_gemm2(
 
     name = (
         f"m3_gemm2_a16w4_ne{NE}_h{N_OUT}_i{K}_tn{TILE_N}_tk{TILE_K}_ks{ksplit}_bcm{b_cache_mod}"
-        + (f"_w{waves_per_eu}" if waves_per_eu else "")
         + (f"_pairs{max_pairs}" if pairs else "")
     )
 
@@ -448,11 +455,8 @@ def compile_gemm2(
             arg_sweights,
             i32_M,
             arg_out,
-            **(
-                {"value_attrs": {"rocdl.waves_per_eu": waves_per_eu}}
-                if waves_per_eu
-                else {}
-            ),
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
+    launch.tile_n = TILE_N
+    launch.ksplit = ksplit
     return launch

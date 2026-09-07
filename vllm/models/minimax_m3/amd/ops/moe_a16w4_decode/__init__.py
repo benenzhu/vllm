@@ -63,24 +63,6 @@ logger = init_logger(__name__)
 TILE_M = 16
 MAX_PAIRS_TOKENS = TILE_M
 MAX_DECODE_TOKENS = 256
-# gemm2 split-K: worth ~1.5 us of latency hiding at small M, costs ~5 us of
-# extra atomics at M=256 (same-GPU sweeps at 32/64 vs 128/256).
-GEMM2_KSPLIT_SMALL_M = 64
-
-# gemm1 tiles from the FlyDSL sweeps (see the module docstring): 2 N-waves x 2
-# K-waves of 16 columns up to 128 tokens, 4 N-waves of 16 columns at 256 tokens.
-GEMM1_TILE_N_LARGE_M = 128
-
-
-def _gemm1_cfg(n_tokens: int) -> dict:
-    if n_tokens > GEMM1_TILE_N_LARGE_M:
-        return dict(tile_n=64, k_waves=1, k_batch=2, prefetch=3, b_nt=2, waves_per_eu=3)
-    return dict(tile_n=32, k_waves=2, k_batch=2, prefetch=3, b_nt=2)
-
-
-GEMM2_CFG = dict(tile_n=256, tile_k=256, b_nt=2, ksplit=3)
-_GEMM2_K_UNIT = GEMM2_CFG["tile_k"] * GEMM2_CFG["ksplit"]
-_GEMM2_N_UNIT = GEMM2_CFG["tile_n"]
 
 # mxfp4 backend -> gemm1 weight layout (w2 and the scales are laid out the same
 # way by both backends: shuffle_weight(16, 16) and e8m0_shuffle).
@@ -93,14 +75,9 @@ _workspaces: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def supports_shapes(hidden_size: int, intermediate_size: int) -> bool:
-    """Static shape gate: gemm1 tiles K by 256 and N by 64, gemm2 tiles N by 256
-    and K by 256 x split-K 3."""
-    return (
-        hidden_size % _GEMM2_N_UNIT == 0
-        and hidden_size % 256 == 0
-        and intermediate_size % _GEMM2_K_UNIT == 0
-        and intermediate_size % 64 == 0
-    )
+    """Static shape gate (tiles fixed in gemm1.py / gemm2.py): gemm1 tiles K by
+    256 and N by 64, gemm2 tiles N by 256 and K by 256 x split-K 3."""
+    return hidden_size % 256 == 0 and intermediate_size % (256 * 3) == 0
 
 
 def supports_batch(x: torch.Tensor) -> bool:
@@ -221,7 +198,6 @@ def a16w4_decode_moe(
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         w_layout=w13_layout,
-        **_gemm1_cfg(n_tokens),
     )
     a16w4_gemm2(
         inter_sorted_bf16=inter,
@@ -236,7 +212,6 @@ def a16w4_decode_moe(
         topk=topk,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-        **GEMM2_CFG,
     )
     return out
 
@@ -289,11 +264,7 @@ def _sorted_decode_moe(
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         w_layout=w13_layout,
-        **_gemm1_cfg(n_tokens),
     )
-    cfg2 = dict(GEMM2_CFG)
-    if n_tokens > GEMM2_KSPLIT_SMALL_M:
-        cfg2["ksplit"] = 1
     a16w4_gemm2(
         inter_sorted_bf16=inter,
         w2_u8=w2,
@@ -307,7 +278,6 @@ def _sorted_decode_moe(
         NE=num_experts,
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
-        **cfg2,
     )
     return out
 

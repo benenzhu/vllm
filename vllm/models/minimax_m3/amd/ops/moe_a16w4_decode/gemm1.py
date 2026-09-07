@@ -3,17 +3,16 @@
 """Decode gate/up GEMM (bf16 x MXFP4 W13, MFMA 16x16x32) fused with swiglu-OAI.
 
 One workgroup per (16-row m-block, TILE_N-column n-block). Its 4 waves split N
-(``k_waves`` 1: four N-waves of TILE_N/4 columns; 2: two N-waves x two K-waves
+(``large_m``: four N-waves of 16 columns; otherwise two N-waves x two K-waves
 with an LDS reduce at the end) and share the A rows: the workgroup loads one
-batch of ``k_batch`` 128-K tiles of the 16 rows (one dwordx4 per lane per
-K-tile, each instruction 4 rows x 256 B = 8 full cache lines) into LDS and every
-wave reads its MFMA A fragments from there. Two LDS slots, one barrier per batch;
-the batch loads go out before the same iteration's W loads so the in-order vmcnt
-wait for that W tile also covers them. W streams through a VGPR ring
-``prefetch`` tiles deep with non-temporal loads (1 KB contiguous per wave
-instruction in aiter's preshuffled layout), the per-32 e8m0 scales come one
-packed dword per 256 K, and the fp4 -> bf16 conversion runs right before each
-MFMA.
+batch of two 128-K tiles of the 16 rows (one dwordx4 per lane per K-tile, each
+instruction 4 rows x 256 B = 8 full cache lines) into LDS and every wave reads
+its MFMA A fragments from there. Two LDS slots, one barrier per batch; the batch
+loads go out before the same iteration's W loads so the in-order vmcnt wait for
+that W tile also covers them. W streams through a VGPR ring three tiles deep
+with non-temporal loads (1 KB contiguous per wave instruction in aiter's
+preshuffled layout), the per-32 e8m0 scales come one packed dword per 256 K, and
+the fp4 -> bf16 conversion runs right before each MFMA.
 
 Two things the compiler needs here: a scheduling barrier after every K-tile
 (otherwise it hoists the conversions of the next tiles above the current MFMAs
@@ -51,6 +50,10 @@ from .utils import (
 BM = 16  # rows per m-block (one MFMA M tile)
 NW = 4  # waves per workgroup
 LDS_PAD = 16  # bytes of padding per LDS row: conflict-free 16 B reads
+# Tiles from the MI355X sweeps (module docstring): up to LARGE_M_TOKENS two N-waves x
+# two K-waves of 16 columns (TILE_N 32); above, four N-waves of 16 columns (TILE_N 64)
+# with 3 waves per EU. Both: A batches of 2 K-tiles, W ring 3 deep, non-temporal W.
+LARGE_M_TOKENS = 128
 
 
 def compile_gemm1(
@@ -59,20 +62,18 @@ def compile_gemm1(
     D_INTER,
     NE,
     TOPK,
-    TILE_N=32,
-    k_waves=2,
-    k_batch=2,
-    prefetch=3,
-    b_cache_mod=2,
+    large_m=False,
     w_layout="standard",
-    waves_per_eu=None,
     pairs=False,
     max_pairs=None,
 ):
+    """Returns the launch function; ``launch.tile_n`` is the N tile for the grid."""
+    TILE_N, KW, waves_per_eu = (64, 1, 3) if large_m else (32, 2, None)
+    KB = 2  # 128-K tiles per A batch through LDS
+    prefetch = 3  # W tiles in flight
+    b_cache_mod = 2  # non-temporal W loads
     K, INTER = D_HIDDEN, D_INTER
     N_OUT = 2 * INTER
-    KW = k_waves
-    assert KW in (1, 2) and TILE_N in (32, 64, 128, 256)
     assert w_layout in ("standard", "guinterleave")
     NWN = NW // KW  # N-waves
     NPW = TILE_N // NWN  # columns per wave (gate and up each)
@@ -80,8 +81,7 @@ def compile_gemm1(
     assert NPW % 16 == 0 and INTER % TILE_N == 0 and K % 256 == 0
     KT = K // 128  # 128-K tiles: 1 KB of W per 16 columns, 256 B of A per row
     KTW = KT // KW  # K-tiles per K-wave
-    KB = k_batch
-    assert KT % KW == 0 and KTW % KB == 0 and KB % 2 == 0 and KTW % 2 == 0
+    assert KT % KW == 0 and KTW % KB == 0 and KTW % 2 == 0
     assert 1 <= prefetch < KTW
     NNB = INTER // TILE_N
     ROWB = KB * 256  # A bytes per row per batch (per K-wave)
@@ -516,4 +516,5 @@ def compile_gemm1(
             ),
         ).launch(grid=(grid_x, 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
+    launch.tile_n = TILE_N
     return launch
