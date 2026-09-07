@@ -277,38 +277,6 @@ def _divmod_nonneg(a, b):
     return divmod(a, b)
 
 
-def _xcd_swizzle(num_pid_m, num_pid_n, WGM=4):
-    """Block id -> (m-tile, n-tile). Groups of WGM m-tiles x all n-tiles land on
-    one XCD, so the m-tiles of one expert (same W13 slab) share that XCD's L2."""
-    NUM_XCDS = 8
-    NUM_CUS = 32 * NUM_XCDS
-    SWIZZLE_THRESHOLD = 4 * NUM_CUS
-
-    wgid = fx.block_idx.x
-    num_wg = num_pid_m * num_pid_n
-    simple_m, simple_n = _divmod_nonneg(wgid, num_pid_n)
-
-    intra_xcd, xcd = _divmod_nonneg(wgid, NUM_XCDS)
-    wgid_remap = xcd * (num_wg // NUM_XCDS) + intra_xcd
-    num_wgid_in_group = WGM * num_pid_n
-    group_id, intra_group = _divmod_nonneg(wgid_remap, num_wgid_in_group)
-    first_pid_m = group_id * WGM
-    if const_expr(isinstance(num_pid_m, int) and num_pid_m % WGM == 0):
-        group_size_m = WGM
-    else:
-        group_size_m = _min(num_pid_m - first_pid_m, WGM)
-    pid_n, intra_group_m = _divmod_nonneg(intra_group, group_size_m)
-    pid_m = first_pid_m + intra_group_m
-
-    use_simple = (num_wg < SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
-    if const_expr(isinstance(use_simple, bool)):
-        return (simple_m, simple_n) if use_simple else (pid_m, pid_n)
-    return (
-        fx.arith.select(use_simple, simple_m, pid_m),
-        fx.arith.select(use_simple, simple_n, pid_n),
-    )
-
-
 # ── FP4 scaled MFMA ──────────────────────────────────────────────────────────
 _FP4_CBSZ = 4
 _FP4_BLGP = 4
@@ -665,22 +633,18 @@ def compile_moe_gemm1(
     I: int,  # noqa: E741
     E: int,
     BLOCK_M: int = 128,
-    use_xcd_remap: bool = True,
-    xcd_wgm: int = 4,
-    tile_map: bool = True,
 ):
     """Grouped fp4 gemm1 for one (H, I, E, BLOCK_M). ``BLOCK_M`` must equal the
     ``moe_sorting`` block size the sorted inputs were built with (128 or 256).
 
-    ``tile_map=True``: block order comes from a host-built int32 table
+    Block order comes from a host-built int32 table
     ``tile_map[remapped block] = m_tile << 3 | n_tile`` (-1 = nothing to do),
     laid out expert by expert and n-slab-major inside an expert, so the 32 CUs
     of one XCD chew through one expert with the same 768 KB gate/up slab of
     W13 in L2 (see ``build_tile_map`` in bench_gemm1.py). The hardware deals
     consecutive block ids round-robin over the 8 XCDs, so block id b is first
     remapped to ``(b % 8) * (grid / 8) + b // 8`` = a contiguous chunk of the
-    table per XCD. ``tile_map=False``: the dense kernel's WGM-group XCD swizzle
-    over (m-tile, n-tile) with the expert read per m-tile."""
+    table per XCD."""
     K = H
     BLOCK_K = 256
     BLOCK_K_BYTES = BLOCK_K // 2
@@ -689,7 +653,6 @@ def compile_moe_gemm1(
     LDS_BLOCK_N = BLOCK_N // 2
     N_TILES_A = LDS_BLOCK_M // 2 // 16  # 16-row tiles per wave per LDS half
     N_TILES_B = LDS_BLOCK_N // 2 // 16  # = 4
-    N_BLOCKS_N = I // LDS_BLOCK_N
 
     assert BLOCK_M in (128, 256)
     assert K % BLOCK_K == 0 and I % LDS_BLOCK_N == 0 and (2 * I) % 256 == 0
@@ -756,50 +719,35 @@ def compile_moe_gemm1(
         eid_rsrc = _buffer_ops.create_buffer_resource(
             sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4
         )
-        if const_expr(tile_map):
-            # The table's valid entries are [0, n_valid) with n_valid stored at
-            # tile_map[grid_size]. Split THOSE evenly over the 8 XCDs (block id b
-            # runs on XCD b % 8): with the whole allocation split instead, the
-            # last XCD(s) got only idle entries at every size (4096 tokens: 2 of 8
-            # XCDs idle, 8192: 1.5, 32768: 0.35).
-            intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
-            tm_rsrc = _buffer_ops.create_buffer_resource(
-                tile_map_t, max_size=False, num_records_bytes=(grid_size + 1) * 4
+        # The table's valid entries are [0, n_valid) with n_valid stored at
+        # tile_map[grid_size]. Split THOSE evenly over the 8 XCDs (block id b
+        # runs on XCD b % 8): with the whole allocation split instead, the
+        # last XCD(s) got only idle entries at every size (4096 tokens: 2 of 8
+        # XCDs idle, 8192: 1.5, 32768: 0.35).
+        intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
+        tm_rsrc = _buffer_ops.create_buffer_resource(
+            tile_map_t, max_size=False, num_records_bytes=(grid_size + 1) * 4
+        )
+        n_valid = fx.Int32(
+            _buffer_ops.buffer_load(
+                tm_rsrc, grid_size, vec_width=1, dtype=fx.Int32, is_scalar=True
             )
-            n_valid = fx.Int32(
-                _buffer_ops.buffer_load(
-                    tm_rsrc, grid_size, vec_width=1, dtype=fx.Int32, is_scalar=True
-                )
+        )
+        per_xcd = (n_valid + fx.Int32(7)) // fx.Int32(8)
+        remapped = xcd * per_xcd + intra_xcd
+        in_chunk = (intra_xcd < per_xcd) & (remapped < n_valid)
+        entry = fx.Int32(
+            _buffer_ops.buffer_load(
+                tm_rsrc,
+                fx.arith.select(in_chunk, remapped, fx.Int32(0)),
+                vec_width=1,
+                dtype=fx.Int32,
             )
-            per_xcd = (n_valid + fx.Int32(7)) // fx.Int32(8)
-            remapped = xcd * per_xcd + intra_xcd
-            in_chunk = (intra_xcd < per_xcd) & (remapped < n_valid)
-            entry = fx.Int32(
-                _buffer_ops.buffer_load(
-                    tm_rsrc,
-                    fx.arith.select(in_chunk, remapped, fx.Int32(0)),
-                    vec_width=1,
-                    dtype=fx.Int32,
-                )
-            )
-            entry = fx.arith.select(in_chunk, entry, fx.Int32(-1))
-            tile_i = entry >> 3
-            tile_j = entry & 7
-            block_valid = entry >= 0
-        else:
-            if const_expr(use_xcd_remap):
-                tile_i, tile_j = _xcd_swizzle(num_m_blocks, N_BLOCKS_N, xcd_wgm)
-            else:
-                tile_i, tile_j = divmod(fx.block_idx.x, N_BLOCKS_N)
-            nv_rsrc = _buffer_ops.create_buffer_resource(
-                num_valid_ids, max_size=False, num_records_bytes=4
-            )
-            num_valid = fx.Int32(
-                _buffer_ops.buffer_load(
-                    nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32
-                )
-            )
-            block_valid = (tile_i * BLOCK_M) < num_valid
+        )
+        entry = fx.arith.select(in_chunk, entry, fx.Int32(-1))
+        tile_i = entry >> 3
+        tile_j = entry & 7
+        block_valid = entry >= 0
         # ---- routing: this m-tile's expert ----
         expert = fx.Int32(
             _buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32)
@@ -1292,10 +1240,7 @@ def compile_moe_gemm1(
         grid_size: fx.Int32,
         stream: fx.Stream,
     ):
-        if const_expr(tile_map):  # noqa: SIM108
-            grid_x = grid_size
-        else:
-            grid_x = num_m_blocks * N_BLOCKS_N
+        grid_x = grid_size
         kernel_gemm1(
             A,
             W13,

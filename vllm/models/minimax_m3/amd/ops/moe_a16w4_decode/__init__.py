@@ -9,7 +9,9 @@ sync gaps between those kernels are a large share of the time. This package
 keeps two FlyDSL GEMM kernels (plus one small sort kernel above 16 tokens):
 
 * ``gemm1``: gate/up GEMM (bf16 x MXFP4, MFMA 16x16x32) fused with the
-  swiglu-OAI activation, bf16 out.
+  swiglu-OAI activation, bf16 out. The 4 waves of a workgroup split N and share
+  the 16 A rows through LDS (one load per lane per K-tile); W streams through a
+  non-temporal VGPR ring.
 * ``gemm2``: down GEMM, split-K over 3 CTAs, routing-weighted bf16 atomic add
   into the (zeroed) output.
 
@@ -42,10 +44,10 @@ aiter path untouched:
 
 MiniMax-M3 TP4 on MI355X, HIP-graph replay, 100 different inputs per graph
 (us per layer, aiter production path in brackets: CK a16w4 below 256 tokens,
-FlyDSL a4w4 with fp4 activations at 256): M=4 26.5 (42.4), M=8 44.3 (60.2),
-M=12 56.8 (74.8), M=16 69.1 (89.4), M=32 104.8 (121.5), M=64 137.8 (153.3),
-M=128 161.7 (181.0), M=256 181.6 (200.3). bf16 activations throughout (cos
-0.99999 to the float reference; aiter's fp4-activation path at 256 is 0.97).
+FlyDSL a4w4 with fp4 activations at 256): M=4 26.6 (42.4), M=8 45.5 (60.2),
+M=16 68.4 (89.4), M=32 100.8 (121.5), M=64 134.1 (153.3), M=128 157.0 (181.0),
+M=256 171.2 (200.3). bf16 activations throughout (cos 0.99999 to the float
+reference; aiter's fp4-activation path at 256 is 0.97).
 """
 
 from __future__ import annotations
@@ -65,29 +67,18 @@ MAX_DECODE_TOKENS = 256
 # extra atomics at M=256 (same-GPU sweeps at 32/64 vs 128/256).
 GEMM2_KSPLIT_SMALL_M = 64
 
-# Best configuration from the FlyDSL sweep (see the module docstring).
-GEMM1_CFG = dict(
-    tile_m=TILE_M,
-    tile_n=32,
-    tile_k=128,
-    k_wave=4,
-    b_nt=2,
-    xcd_swizzle=0,
-    a_direct=True,
-    prefetch=3,
-    scale_share=True,
-    act="swigluoai",
-)
-GEMM2_CFG = dict(
-    tile_m=TILE_M,
-    tile_n=256,
-    tile_k=256,
-    b_nt=2,
-    xcd_swizzle=0,
-    ksplit=3,
-    pad_mask=True,
-    hoist=True,
-)
+# gemm1 tiles from the FlyDSL sweeps (see the module docstring): 2 N-waves x 2
+# K-waves of 16 columns up to 128 tokens, 4 N-waves of 16 columns at 256 tokens.
+GEMM1_TILE_N_LARGE_M = 128
+
+
+def _gemm1_cfg(n_tokens: int) -> dict:
+    if n_tokens > GEMM1_TILE_N_LARGE_M:
+        return dict(tile_n=64, k_waves=1, k_batch=2, prefetch=3, b_nt=2, waves_per_eu=3)
+    return dict(tile_n=32, k_waves=2, k_batch=2, prefetch=3, b_nt=2)
+
+
+GEMM2_CFG = dict(tile_n=256, tile_k=256, b_nt=2, ksplit=3)
 _GEMM2_K_UNIT = GEMM2_CFG["tile_k"] * GEMM2_CFG["ksplit"]
 _GEMM2_N_UNIT = GEMM2_CFG["tile_n"]
 
@@ -102,8 +93,14 @@ _workspaces: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def supports_shapes(hidden_size: int, intermediate_size: int) -> bool:
-    """Static shape gate: gemm2 tiles N by 256 and K by 256 x split-K 3."""
-    return hidden_size % _GEMM2_N_UNIT == 0 and intermediate_size % _GEMM2_K_UNIT == 0
+    """Static shape gate: gemm1 tiles K by 256 and N by 64, gemm2 tiles N by 256
+    and K by 256 x split-K 3."""
+    return (
+        hidden_size % _GEMM2_N_UNIT == 0
+        and hidden_size % 256 == 0
+        and intermediate_size % _GEMM2_K_UNIT == 0
+        and intermediate_size % 64 == 0
+    )
 
 
 def supports_batch(x: torch.Tensor) -> bool:
@@ -224,7 +221,7 @@ def a16w4_decode_moe(
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         w_layout=w13_layout,
-        **GEMM1_CFG,
+        **_gemm1_cfg(n_tokens),
     )
     a16w4_gemm2(
         inter_sorted_bf16=inter,
@@ -292,7 +289,7 @@ def _sorted_decode_moe(
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         w_layout=w13_layout,
-        **GEMM1_CFG,
+        **_gemm1_cfg(n_tokens),
     )
     cfg2 = dict(GEMM2_CFG)
     if n_tokens > GEMM2_KSPLIT_SMALL_M:

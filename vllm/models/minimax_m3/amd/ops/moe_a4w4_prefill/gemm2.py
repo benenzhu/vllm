@@ -48,8 +48,6 @@ Layouts (bytes):
   OUT_sc    [n_tokens*topk, H/32]         e8m0 (fp8 mode; any buffer in bf16 mode)
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
@@ -333,19 +331,13 @@ class _BScaleGather:
         )
 
 
-_NO_STORE = (
-    os.environ.get("M3_G2_NO_STORE", "0") == "1"
-)  # timing experiments only: no output stores
 # Output data stores are non-temporal (gfx950 cache-policy bit 0x2 = ``nt``): the
-# scattered
-# 512-B (bf16) / 256-B (fp8) row pieces are written once and never re-read by this
-# kernel,
-# and streaming them past L2 is 3-8% faster at 4096..32768 tokens (bf16 32768: 662 ->
-# 620 us).
-# The fp8 e8m0 scale stores are 4-B pieces and get slower with nt (they rely on L2 write
-# combining), so they keep the default policy. Env overrides are for experiments only.
-_STORE_CPOL = int(os.environ.get("M3_G2_STORE_CPOL", "0x2"), 0)
-_STORE_CPOL_SC = int(os.environ.get("M3_G2_STORE_CPOL_SC", "0"), 0)
+# scattered 512-B (bf16) / 256-B (fp8) row pieces are written once and never re-read
+# by this kernel, and streaming them past L2 is 3-8% faster at 4096..32768 tokens
+# (bf16 32768: 662 -> 620 us). The fp8 e8m0 scale stores are 4-B pieces and get
+# slower with nt (they rely on L2 write combining), so they keep the default policy.
+_STORE_CPOL = 0x2
+_STORE_CPOL_SC = 0
 
 
 def compile_moe_gemm2(
@@ -887,15 +879,14 @@ def compile_moe_gemm2(
                         row = lane_id // CH + ROWS_PER_ST * k
                         chunk = lane_id % CH
                         data = _lds_load_vec(_stg_addr(row, chunk, 0), 4)
-                        if const_expr(not _NO_STORE):
-                            _buffer_ops.buffer_store(
-                                data,
-                                out_rsrc,
-                                out_off[h][k] + col_wave + chunk * 16,
-                                mask=mask,
-                                offset_is_bytes=True,
-                                cache_modifier=_STORE_CPOL,
-                            )
+                        _buffer_ops.buffer_store(
+                            data,
+                            out_rsrc,
+                            out_off[h][k] + col_wave + chunk * 16,
+                            mask=mask,
+                            offset_is_bytes=True,
+                            cache_modifier=_STORE_CPOL,
+                        )
 
                     ts.append(_st)
                 if const_expr(FP8):
@@ -903,15 +894,14 @@ def compile_moe_gemm2(
                     def _st_sc():
                         scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
                         sc_col = (chunk_n0 + _pn(nt)) * fx.Int32(BN // 32) + wave_j * 4
-                        if const_expr(not _NO_STORE):
-                            _buffer_ops.buffer_store(
-                                scv,
-                                osc_rsrc,
-                                sc_off[h] + sc_col,
-                                mask=mask,
-                                offset_is_bytes=True,
-                                cache_modifier=_STORE_CPOL_SC,
-                            )
+                        _buffer_ops.buffer_store(
+                            scv,
+                            osc_rsrc,
+                            sc_off[h] + sc_col,
+                            mask=mask,
+                            offset_is_bytes=True,
+                            cache_modifier=_STORE_CPOL_SC,
+                        )
 
                     ts.append(_st_sc)
                 return ts
