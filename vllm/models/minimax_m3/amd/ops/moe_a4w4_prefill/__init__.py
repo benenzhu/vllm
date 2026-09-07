@@ -65,7 +65,6 @@ logger = init_logger(__name__)
 MIN_PREFILL_TOKENS = 3072
 MAX_PREFILL_TOKENS = 32768
 BM256_FROM_TOKENS = 16384  # sort / gemm1 block of 256 rows from here up
-SORT_CTAS = 32
 GEMM2_N_SPLIT = 2
 GEMM1_SWIGLU_ALPHA = 1.702
 GEMM1_SWIGLU_LIMIT = 7.0
@@ -130,9 +129,7 @@ def _run_compiled(exe, *args):
 def _get_sort(num_experts: int, topk: int, block_m: int):
     from .sort import compile_moe_sort
 
-    return compile_moe_sort(
-        E=num_experts, topk=topk, block_m=block_m, sort_ctas=SORT_CTAS
-    )
+    return compile_moe_sort(E=num_experts, topk=topk, block_m=block_m)
 
 
 @functools.cache
@@ -215,7 +212,7 @@ def a4w4_prefill_moe(
     inter = intermediate_size
 
     # 1. routing sort (aiter moe_sorting contract, block size bm)
-    bufs = SortBuffers.allocate(n_tokens, num_experts, topk, bm, SORT_CTAS, device)
+    bufs = SortBuffers.allocate(n_tokens, num_experts, topk, bm, device)
     _get_sort(num_experts, topk, bm)(
         *bufs.launch_args(topk_ids, topk_weights, n_tokens)
     )
@@ -238,7 +235,6 @@ def a4w4_prefill_moe(
         bufs.sorted_expert_ids,
         bufs.num_valid_ids,
         tile_map,
-        num_m_blocks,
         grid1,
         stream,
     )

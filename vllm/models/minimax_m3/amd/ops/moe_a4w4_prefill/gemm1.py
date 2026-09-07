@@ -589,15 +589,6 @@ def _as_f32(i):
     return fx.Float32(fx.arith.bitcast(_T.f32, fx.as_ir_value(i)))
 
 
-def _e8m0_even_headroom2(amax):
-    """aiter's fused FlyDSL stage-1 rule: round amax to the nearest power of two
-    (mantissa half-step 0x400000), take its biased exponent, minus 2 (fp4 max
-    is 6 = 1.5 * 2^2), floor at 0."""
-    r = (_bits(amax) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-    e = (r >> 23) - fx.Int32(2)
-    return fx.arith.select(e > fx.Int32(0), e, fx.Int32(0))
-
-
 def _cvt_pk_fp4(old, a, b, scale_f32, sel):
     """v_cvt_scalef32_pk_fp4_f32: two f32 / 2^(e8m0-127) -> 2 fp4 into byte ``sel``."""
     return fx.Int32(

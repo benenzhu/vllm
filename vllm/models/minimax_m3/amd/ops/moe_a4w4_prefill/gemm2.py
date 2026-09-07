@@ -135,11 +135,6 @@ def _lds_store_vec(vec, addr_i32, n):
     _llvm.StoreOp(vec, _lds_ptr(addr_i32), alignment=4 * n)
 
 
-def _lds_store_i8(v_i32, addr_i32):
-    b = _arith.TruncIOp(_ir.IntegerType.get_signless(8), fx.as_ir_value(v_i32)).result
-    _llvm.StoreOp(b, _lds_ptr(addr_i32), alignment=1)
-
-
 def _i1(v: bool):
     t = _ir.IntegerType.get_signless(1)
     return _arith.ConstantOp(t, _ir.IntegerAttr.get(t, 1 if v else 0)).result
@@ -200,19 +195,6 @@ def _permlane32_swap(d_a, d_b):
     return fx.Int32(_llvm.extractvalue(_T.i32, res, [0])), fx.Int32(
         _llvm.extractvalue(_T.i32, res, [1])
     )
-
-
-def _xlane_max4(x):
-    """max over the 4 lanes {L, L^16, L^32, L^48} (one row's 4 column groups), in every
-    lane.
-    permlane32_swap(x, x) yields [lo, lo] / [hi, hi]; permlane16_swap(y, y) yields
-    [r0, r0, r2, r2] / [r1, r1, r3, r3]; a max after each gives the butterfly."""
-    xi = _bits(x)
-    a, b = _permlane32_swap(xi, xi)
-    m = _maxf(_as_f32(a), _as_f32(b))
-    mi = _bits(m)
-    a, b = _permlane16_swap(mi, mi)
-    return _maxf(_as_f32(a), _as_f32(b))
 
 
 def _maxf_nn(a, b):
