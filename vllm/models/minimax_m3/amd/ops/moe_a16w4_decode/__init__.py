@@ -151,6 +151,9 @@ def a16w4_decode_moe(
         a16w4_gemm1,
         a16w4_gemm2,
     )
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
+        moe_sort_decode,
+    )
 
     n_tokens = x.shape[0]
     assert n_tokens <= MAX_DECODE_TOKENS, n_tokens
@@ -164,25 +167,17 @@ def a16w4_decode_moe(
         out = torch.empty(
             (n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device
         )
-    if n_tokens > MAX_INLINE_SORT_TOKENS:
-        return _sorted_decode_moe(
-            x,
-            w13,
-            w13_scale,
-            w2,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            inter,
-            out,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_limit=swiglu_limit,
-            w13_layout=w13_layout,
+    inline = n_tokens <= MAX_INLINE_SORT_TOKENS
+    if inline:
+        # no sort kernel: the GEMM blocks group the routing pairs themselves and
+        # gemm1's pair-0 blocks zero `out` for gemm2's atomics
+        sorted_ids = sorted_w = sorted_eids = num_valid = None
+    else:
+        # expert-sorted rows in TILE_M-row blocks (aiter moe_sorting contract);
+        # the sort kernel also zeroes `out`
+        sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sort_decode(
+            topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out=out
         )
-    # gemm1 zeroes `out` (its pair-0 blocks) before gemm2's atomics.
     a16w4_gemm1(
         x_bf16=x,
         w1_u8=w13,
@@ -193,12 +188,15 @@ def a16w4_decode_moe(
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
         topk=topk,
-        inline_sort=True,
-        topk_ids=topk_ids,
-        zero_out=out,
         alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         w_layout=w13_layout,
+        inline_sort=inline,
+        topk_ids=topk_ids,
+        zero_out=out,
+        sorted_expert_ids=sorted_eids,
+        num_valid_ids=num_valid,
+        sorted_token_ids=sorted_ids,
     )
     a16w4_gemm2(
         inter_sorted_bf16=inter,
@@ -209,76 +207,14 @@ def a16w4_decode_moe(
         NE=num_experts,
         D_HIDDEN=hidden_size,
         D_INTER=intermediate_size,
-        inline_sort=True,
+        inline_sort=inline,
         topk=topk,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-    )
-    return out
-
-
-def _sorted_decode_moe(
-    x,
-    w13,
-    w13_scale,
-    w2,
-    w2_scale,
-    topk_weights,
-    topk_ids,
-    inter,
-    out,
-    *,
-    hidden_size,
-    intermediate_size,
-    num_experts,
-    swiglu_alpha,
-    swiglu_limit,
-    w13_layout,
-):
-    """``16 < M <= 256``: sort_decode (sort + zero `out`) -> gemm1 -> gemm2 on
-    expert-sorted rows (aiter ``moe_sorting`` contract, TILE_M-row blocks)."""
-    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.host import (
-        a16w4_gemm1,
-        a16w4_gemm2,
-    )
-    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
-        moe_sort_decode,
-    )
-
-    n_tokens, topk = topk_ids.shape
-    sorted_ids, sorted_w, sorted_eids, num_valid, _ = moe_sort_decode(
-        topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out=out
-    )
-    a16w4_gemm1(
-        x_bf16=x,
-        w1_u8=w13,
-        w1_scale_u8=w13_scale,
-        sorted_expert_ids=sorted_eids,
-        num_valid_ids=num_valid,
-        sorted_token_ids=sorted_ids,
-        inter_sorted_bf16=inter,
-        n_tokens=n_tokens,
-        NE=num_experts,
-        D_HIDDEN=hidden_size,
-        D_INTER=intermediate_size,
-        topk=topk,
-        alpha=swiglu_alpha,
-        swiglu_limit=swiglu_limit,
-        w_layout=w13_layout,
-    )
-    a16w4_gemm2(
-        inter_sorted_bf16=inter,
-        w2_u8=w2,
-        w2_scale_u8=w2_scale,
         sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid,
         sorted_token_ids=sorted_ids,
         sorted_weights=sorted_w,
-        out_bf16=out,
-        n_tokens=n_tokens,
-        NE=num_experts,
-        D_HIDDEN=hidden_size,
-        D_INTER=intermediate_size,
     )
     return out
 
