@@ -7,25 +7,30 @@ bf16 output:
 
 reduced by aiter's ``moe_reduction_kernel`` like production stage 2.
 
-Structure: the fp8 gemm1 mainloop (4-wave 2x2, 8-buffer LDS ping-pong, depth-2
-K pipeline of 128-K steps, ``v_mfma_scale_f32_16x16x128_f8f6f4``, AGPR
-accumulators) run as one flat sequence over the CTA's n-tiles: a CTA owns an
-m-tile of 128 sorted rows and sweeps ``NT`` n-tiles of 256 W2 rows (``n_split``
-CTAs share the 6144 columns; rotated start inside long same-expert runs as in
-the a4w4 kernel). K = I = 768 is 6 steps per n-tile; the loads for the first two
-steps of n-tile t+1 are issued during steps 4/5 of n-tile t, so the DMA stream
-never drains. A (16 KB per step) is re-read from L2 per n-tile: the fp8 A tile
-(96 KB) does not fit next to two B stages in LDS, and pinned in AGPRs it would
-take 192 of them.
+Structure: the fp8 gemm1 mainloop (4-wave 2x2, LDS ping-pong, 128-K steps,
+``v_mfma_scale_f32_16x16x128_f8f6f4``, AGPR accumulators) run as one flat
+sequence over the CTA's n-tiles: a CTA owns an m-tile of 128 sorted rows and
+sweeps ``NT`` n-tiles of 256 W2 rows (``n_split`` CTAs share the 6144 columns;
+rotated start inside long same-expert runs as in the a4w4 kernel). K = I = 768
+is 6 steps per n-tile; the loads for the first steps of n-tile t+1 are issued
+during n-tile t, so the DMA stream never drains. W2 (from HBM) is prefetched
+three steps ahead (3 LDS stages), A (16 KB per step, re-read from L2 per
+n-tile) two: the fp8 A tile (96 KB) does not fit next to the B stages in LDS,
+and pinned in AGPRs it would take 192 of them. LDS: 32 KB A + 96 KB B + 16 KB
+scales + 16 KB epilogue staging = 160 KB.
 
 Epilogue: after the last MFMA of an n-tile the 128 accumulators are scaled by
-the row's routing weight, packed to bf16 and stored token-major (8 B per lane
-per tile, non-temporal). Every store is in bounds: the padded rows (tok ==
-n_tokens) go to ``topk`` scratch rows appended to OUT.
+the row's routing weight, packed to bf16, staged 16 rows at a time in a
+wave-private LDS buffer (XOR-swizzled rows) and flushed token-major as full
+128-B lines (16 B per lane, non-temporal; 8-B stores straight from the
+accumulators cost 35% of the kernel). Padded rows (tok == n_tokens) fall
+outside the output buffer resource and are dropped.
 
 Scale blocks (256 B = 32 rows x 8 K-groups): 3 per operand per n-tile
-(K = 768), 6 LDS slots; block g of n-tile t sits in slot (3t + g) % 6, gathered
-three steps ahead (step 1: block 2 of t; steps 3/5: blocks 0/1 of t+1).
+(K = 768), numbered b = 3t + g across the sweep and kept in 4 LDS slots (b % 4);
+block b is gathered at flat step 2b - 3 (step 1: block 2 of t; steps 3/5: blocks
+0/1 of t+1), three steps ahead, and its slot is next taken by block b + 4 at
+flat step 2b + 5, after b's last read at 2b.
 
 Layouts (bytes):
   A         [num_m_blocks*BM, I]         sorted rows, fp8 (gemm1 OUT_Q)
@@ -33,7 +38,7 @@ Layouts (bytes):
   W2        [E, H, I]                    aiter shuffle_weight (16 x 64 K blocks)
   W2_sc     [E*H/32, I/256, 4, 16] dwords aiter shuffle_scale
   sorted_w  [num_m_blocks*BM]            f32 routing weight per sorted row
-  OUT       [n_tokens*topk + topk, H]    bf16 (the last topk rows: scratch)
+  OUT       [n_tokens*topk, H]           bf16
 """
 
 import flydsl.compiler as flyc
@@ -51,6 +56,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill.gemm1 import (
     S2RLoaderFp4,
     ScaleGatherMoE,
     ScaleLoaderLDS,
+    _asm_void,
     _Buf,
     _divmod_nonneg,
     _flat_frag,
@@ -65,12 +71,14 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill.gemm2 import (
     _NUM_XCDS,
     _STORE_CPOL,
     _bf16x2,
+    _lds_load_vec,
+    _lds_store_vec,
     _v2i32,
 )
 
 from .gemm1 import BLOCK_K, Mfma16x16x128Fp8
 
-_SCALE_SLOTS2 = 6
+_SCALE_SLOTS2 = 4
 
 
 def compile_moe_gemm2(
@@ -81,10 +89,12 @@ def compile_moe_gemm2(
     topk: int,
     n_split: int = 2,
     sort_block_m: int = 128,
+    rotate: bool = True,
 ):
     """Grouped fp8 gemm2 for one (H, I, E, topk). ``sort_block_m`` (128 / 256) is
     the ``moe_sorting`` block of the inputs; the kernel tiles 128 rows and skips the
-    all-padding halves of a 256-sort."""
+    all-padding halves of a 256-sort. ``rotate``: the rotated n-tile sweep inside
+    long same-expert runs (off: every CTA sweeps from its chunk's first n-tile)."""
     BM = 128
     BN = 256
     K = I
@@ -104,17 +114,25 @@ def compile_moe_gemm2(
     N_ACCUMS = N_TILES_A * N_TILES_B
     NB = N_TILES_B
     NA = N_TILES_A
-    S_STORES = 4 * N_ACCUMS  # 8-B stores per lane per n-tile (4 quadrants x 8 tiles)
     OUT_ROW_BYTES = H * 2
     W2_BYTES = E * H * K
     assert W2_BYTES <= 0xFFFFFFFF
     B_TILE_BYTES = BN * K_BYTES  # one n-tile of W2 (256 rows)
 
+    B_STAGES = 3
     a_lds_size = LDS_BLOCK_M * BLOCK_K_BYTES  # 8 KB
     b_lds_size = LDS_BLOCK_N * BLOCK_K_BYTES  # 16 KB
-    A_BUFS = 4 * a_lds_size
-    LDS_TILES_BYTES = A_BUFS + 4 * b_lds_size  # 96 KB
-    SCALE_LDS_BYTES2 = _SCALE_SLOTS2 * _SCALE_SLOT_BYTES  # 24 KB
+    A_BUFS = 4 * a_lds_size  # 32 KB: 2 stages x 2 halves
+    LDS_TILES_BYTES = A_BUFS + 2 * B_STAGES * b_lds_size  # 128 KB
+    SCALE_LDS_BYTES2 = _SCALE_SLOTS2 * _SCALE_SLOT_BYTES  # 16 KB
+    # epilogue staging, wave-private: 16 rows x (2 halves x 64 cols) bf16, 256 B rows
+    STG_ROW = 2 * N_TILES_B * 16 * 2  # 256 B: the wave's two 128-B line segments
+    STG_CH = STG_ROW // 16  # 16 chunks of 16 B per staged row
+    STG_ROWS = 16  # one (row half, a-tile) at a time
+    STG_WAVE = STG_ROWS * STG_ROW  # 4 KB
+    STG_LDS_BYTES = _N_WAVES * STG_WAVE  # 16 KB
+    N_FLUSH = (STG_ROWS * 2) // 8  # dwordx4 stores per round per lane: 32 lines, 8 each
+    assert LDS_TILES_BYTES + SCALE_LDS_BYTES2 + STG_LDS_BYTES <= 160 * 1024
 
     A_WAVE_GROUPS = N_TILES_A // 2  # 1
     A_HALF_GROUPS = LDS_BLOCK_M // 32  # 2
@@ -127,6 +145,7 @@ def compile_moe_gemm2(
     class SharedStorage:
         all_lds: fx.Array[fx.Int8, LDS_TILES_BYTES, 16]
         scale_lds: fx.Array[fx.Int8, SCALE_LDS_BYTES2, 16]
+        stage_lds: fx.Array[fx.Int8, STG_LDS_BYTES, 16]
 
     @flyc.kernel
     def kernel_gemm2(
@@ -146,15 +165,17 @@ def compile_moe_gemm2(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         _base_ptr = lds.all_lds.ptr
         _scale_base_ptr = lds.scale_lds.ptr
+        _stg_ptr = lds.stage_lds.ptr
 
         a_cur0 = _Buf(_base_ptr, 0 * a_lds_size)
         a_cur1 = _Buf(_base_ptr, 1 * a_lds_size)
         a_next0 = _Buf(_base_ptr, 2 * a_lds_size)
         a_next1 = _Buf(_base_ptr, 3 * a_lds_size)
-        b_cur0 = _Buf(_base_ptr, A_BUFS + 0 * b_lds_size)
-        b_cur1 = _Buf(_base_ptr, A_BUFS + 1 * b_lds_size)
-        b_next0 = _Buf(_base_ptr, A_BUFS + 2 * b_lds_size)
-        b_next1 = _Buf(_base_ptr, A_BUFS + 3 * b_lds_size)
+        # B: 3 stages x 2 halves
+        b_st = [
+            [_Buf(_base_ptr, A_BUFS + (2 * st + hf) * b_lds_size) for hf in range(2)]
+            for st in range(B_STAGES)
+        ]
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -230,6 +251,8 @@ def compile_moe_gemm2(
             )
         )
         rot_on = (_lo_ok & (_e_lo == expert)) | (_hi_ok & (_e_hi == expert))
+        if const_expr(not rotate):
+            rot_on = rot_on & (fx.Int32(0) == fx.Int32(1))
         nt_rot = rot_on.select(
             _divmod_nonneg(tile_i * fx.Int32(ROT_STRIDE), NT)[1], fx.Int32(0)
         )
@@ -257,14 +280,9 @@ def compile_moe_gemm2(
             b_rsrc = buffer_ops.create_buffer_resource(
                 W2, max_size=False, num_records_bytes=W2_BYTES
             )
-            # OUT has topk scratch rows after the n_tokens*topk real ones: the padded
-            # sorted rows (tok == n_tokens) and the prologue's dummy stores land there,
-            # so every store is in bounds and retires in issue order (a dropped
-            # out-of-bounds store completes early and breaks the vmcnt schedule)
+            # padded sorted rows (tok == n_tokens) fall outside the resource: dropped
             out_rsrc = buffer_ops.create_buffer_resource(
-                OUT,
-                max_size=False,
-                num_records_bytes=(n_tokens + fx.Int32(1)) * (topk * OUT_ROW_BYTES),
+                OUT, max_size=False, num_records_bytes=n_tokens * (topk * OUT_ROW_BYTES)
             )
 
             # ---- A rows (sorted, contiguous): row * K_BYTES + swizzled col ----
@@ -351,19 +369,18 @@ def compile_moe_gemm2(
 
             # ---- output rows / weights of the 4 rows this lane writes ----
             def _orow(sid):
-                tok = sid & fx.Int32(0x00FFFFFF)  # padded: tok == n_tokens -> scratch
+                tok = sid & fx.Int32(0x00FFFFFF)  # padded: tok == n_tokens -> OOB
                 slot = (sid >> 24) & fx.Int32(0xFF)
                 return tok * fx.Int32(topk) + slot
 
-            out_off = []
+            # routing weight of the lane's own rows (row half h, tile ti, r16) and the
+            # output row offsets of the rows the lane flushes (per (h, ti), store k:
+            # staged row 4k + lane//16)
+            wave_row0 = m_base + wave_i * (N_TILES_A * 16)
             row_w = []
             for h in range_constexpr(2):
                 for ti in range_constexpr(N_TILES_A):
-                    row = m_base + fx.Int32(h * LDS_BLOCK_M) + wave_i * (N_TILES_A * 16) + ti * 16 + r16
-                    sid = fx.Int32(
-                        buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=fx.Int32)
-                    )
-                    out_off.append(_orow(sid) * fx.Int32(OUT_ROW_BYTES))
+                    row = wave_row0 + fx.Int32(h * LDS_BLOCK_M + ti * 16) + r16
                     row_w.append(
                         fx.Float32(
                             buffer_ops.buffer_load(
@@ -371,49 +388,66 @@ def compile_moe_gemm2(
                             )
                         )
                     )
-            # ---- prologue = "steps 4 and 5 of n-tile -1": the same issue order as
-            # the steady state (step 4: a0 b0 b1 a1; step 5: a0 b0 b1 gather a1),
-            # block 0's gather up front ----
+            flush_off = []
+            for h in range_constexpr(2):
+                for ti in range_constexpr(NA):
+                    for k in range_constexpr(N_FLUSH):
+                        row = wave_row0 + fx.Int32(h * LDS_BLOCK_M + ti * 16 + 4 * k) + lane_id // 16
+                        sid = fx.Int32(
+                            buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=fx.Int32)
+                        )
+                        flush_off.append(_orow(sid) * fx.Int32(OUT_ROW_BYTES))
+            stg_base = fx.Int32(fx.ptrtoint(_stg_ptr)) + wave_id * fx.Int32(STG_WAVE)
+
+            def _stg_addr(row, chunk, half):
+                """staged (row 0..15, 16-B chunk, 8-B half); chunks XOR-swizzled by the
+                row so the tile-wise writes and the line-wise reads spread over the
+                banks"""
+                return stg_base + row * fx.Int32(STG_ROW) + ((chunk ^ (row % STG_CH)) * 16 + half * 8)
+            # ---- prologue = "steps -3, -2, -1" of the steady-state issue order
+            # (B three steps ahead, A two): B(0); B(1) a0(0) a1(0); B(2) a0(1)
+            # gather a1(1); block 0's gather up front ----
             _set_scale_tile(fx.Int32(0))
             scale_gather.gather(0, _slot(0, 0))
             b_soff0 = _n_glob(fx.Int32(0)) * fx.Int32(B_TILE_BYTES)
+            b0_g2s.load(b_st[0][0], b_soff0 + fx.Int32(0 * B_K_STEP))
+            b1_g2s.load(b_st[0][1], b_soff0 + fx.Int32(0 * B_K_STEP))
+            b0_g2s.load(b_st[1][0], b_soff0 + fx.Int32(1 * B_K_STEP))
+            b1_g2s.load(b_st[1][1], b_soff0 + fx.Int32(1 * B_K_STEP))
             a0_g2s.load(a_cur0, fx.Int32(0 * A_K_STEP))
-            b0_g2s.load(b_cur0, b_soff0 + fx.Int32(0 * B_K_STEP))
-            b1_g2s.load(b_cur1, b_soff0 + fx.Int32(0 * B_K_STEP))
             a1_g2s.load(a_cur1, fx.Int32(0 * A_K_STEP))
+            b0_g2s.load(b_st[2][0], b_soff0 + fx.Int32(2 * B_K_STEP))
+            b1_g2s.load(b_st[2][1], b_soff0 + fx.Int32(2 * B_K_STEP))
             a0_g2s.load(a_next0, fx.Int32(1 * A_K_STEP))
-            b0_g2s.load(b_next0, b_soff0 + fx.Int32(1 * B_K_STEP))
-            b1_g2s.load(b_next1, b_soff0 + fx.Int32(1 * B_K_STEP))
             scale_gather.gather(1, _slot(0, 1))
             a1_g2s.load(a_next1, fx.Int32(1 * A_K_STEP))
 
-            # gather 0 + a_cur0 landed: everything younger may fly
-            wait_barrier((3 * NA) + (4 * NB) + 1)
+            # gather 0, B(0) and a0(0) landed: a1(0), B(2), a0(1), gather, a1(1) may fly
+            wait_barrier(NA + 2 * NB + NA + 1 + NA)
             a0_frag = a_s2r.load(a_cur0)
-            # b_cur0 and b_cur1 landed
-            wait_barrier((3 * NA) + (2 * NB) + 1)
-            b0_frag = b_s2r.load(b_cur0, preshuffled=True)
-            b1_frag = b_s2r.load(b_cur1, preshuffled=True)
+            b0_frag = b_s2r.load(b_st[0][0], preshuffled=True)
+            b1_frag = b_s2r.load(b_st[0][1], preshuffled=True)
             sc0_saR0, sc0_saR1 = a_scale_ld.read(_slot(0, 0))
             sc0_sbC0, sc0_sbC1 = b_scale_ld.read(_slot(0, 0))
             sc0 = (sc0_saR0, sc0_saR1, sc0_sbC0, sc0_sbC1)
 
-            # Per step kc (0..5) of n-tile nt, in issue order: a0 (NA), b0 (NB),
-            # [SEG2] b1 (NB), scale gather (odd kc), a1 (NA), all for flat step
-            # 6*nt + kc + 2; after step 5's MFMAs the S_STORES epilogue stores.
-            # Loop-top wait: the step before the previous one complete; SEG2: the
-            # previous step's a0/b0/b1 landed. The counts are the loads issued after
-            # the last one needed; the epilogue stores are not counted: stores and
-            # loads retire out of order with respect to each other (LLVM's
-            # SIInsertWaitcnts: mixed pending events), so a count that included the
-            # stores as younger ops could pass with the needed loads still in flight
-            # (measured: races in the first n-tile). The price is that step 0's top
-            # wait of the next tile drains the stores.
+            # Per step kc (0..5) of n-tile nt, in issue order: B(kc+3) b0 (NB) b1
+            # (NB), a0(kc+2) (NA), [MID] scale gather (odd kc), a1(kc+2) (NA). B for
+            # flat step f goes to stage f % 3 (the stage consumed in this step: its
+            # halves were read into registers in the previous step), A to stage
+            # f % 2. Loop-top wait: a1(kc) landed (issued last in step kc-2), i.e.
+            # all of step kc-1's loads may fly; MID: a0(kc+1) landed (issued in step
+            # kc-1 before its gather and a1), B(kc+1) is older. Both counts are the
+            # loads issued after the one needed; the epilogue stores are not
+            # counted: stores and loads retire out of order with respect to each
+            # other (LLVM's SIInsertWaitcnts: mixed pending events), so a count that
+            # included them could pass with the needed loads still in flight
+            # (measured: races in the first n-tile).
             def _top_vmcnt(kc):
-                return 2 * NA + 2 * NB + (1 - kc % 2)
+                return 2 * NB + 2 * NA + (1 - kc % 2)
 
-            def _seg2_vmcnt(kc):
-                return 2 * NA + NB + (1 - kc % 2)
+            def _mid_vmcnt(kc):
+                return NA + 2 * NB + NA + (1 - kc % 2)
 
             def _read_scale_thunks(nt, kc_next, holder):
                 # scales of flat step +1: same tile block kc_next//2, or block 0 of
@@ -431,10 +465,12 @@ def compile_moe_gemm2(
                     lambda: _r(3, b_scale_ld, 1),
                 ]
 
-            def _one_step(nt, kc, a0f, b0f, b1f_in, sc, accs, bufs):
+            def _one_step(nt, kc, a0f, b0f, b1f_in, sc, accs, abufs):
                 """``nt`` loop value (logical n-tile), ``kc`` Python int 0..5."""
                 k2 = kc % 2
-                ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
+                ac0, ac1, an0, an1 = abufs
+                bst = b_st[kc % 3]  # consumed this step, refilled for step kc + 3
+                bnx = b_st[(kc + 1) % 3]  # step kc + 1's halves, read this step
                 saR0, saR1, sbC0, sbC1 = sc
                 c00f, c01f, c10f, c11f = accs
                 zero_acc = kc == 0
@@ -443,11 +479,13 @@ def compile_moe_gemm2(
                 _a0n = [None] * NA
                 _b0n = [None] * NB
                 _b1n = [None] * NB
-                # loads for flat step kc + 2
-                kn = (kc + 2) % K_ITERS
-                nt_ld = nt if kc + 2 < K_ITERS else nt + fx.Int32(1)
-                a_off = fx.Int32(kn * A_K_STEP)
-                b_off = _n_glob(nt_ld) * fx.Int32(B_TILE_BYTES) + fx.Int32(kn * B_K_STEP)
+                # A for flat step kc + 2, B for kc + 3 (the latter in tile nt + 1
+                # from kc = 3 on)
+                ka = (kc + 2) % K_ITERS
+                kb = (kc + 3) % K_ITERS
+                nt_b = nt + fx.Int32((kc + 3) // K_ITERS)
+                a_off = fx.Int32(ka * A_K_STEP)
+                b_off = _n_glob(nt_b) * fx.Int32(B_TILE_BYTES) + fx.Int32(kb * B_K_STEP)
 
                 _scn = [None, None, None, None]
                 _rd_scn = _read_scale_thunks(nt, kc + 1, _scn)
@@ -459,7 +497,7 @@ def compile_moe_gemm2(
                 wait_barrier(_top_vmcnt(kc))
                 il = (
                     _riffle(
-                        _g2s_thunks(a0_g2s, ac0, a_off, NA),
+                        _g2s_thunks(b0_g2s, bst[0], b_off, NB),
                         _s2r_thunks(a_s2r, ac1, _a1, NA, False),
                     )
                     + _rd_scn[:2]
@@ -468,21 +506,22 @@ def compile_moe_gemm2(
                     a0f, b0f, c00f, saR0, sbC0, 0, k2, interleave=il, zero_acc=zero_acc,
                     sb_index=sb_index,
                 )
-                il = _riffle(_g2s_thunks(b0_g2s, bc0, b_off, NB), _rd_scn[2:])
+                # two G2S loaders are never riffled: each one's steps share m0
+                # (s_mov then s_add per step), interleaving them corrupts the LDS
+                # destinations
+                il = (
+                    _g2s_thunks(b1_g2s, bst[1], b_off, NB)
+                    + _g2s_thunks(a0_g2s, ac0, a_off, NA)
+                    + _rd_scn[2:]
+                )
                 c01f = mfma.call(
                     a0f, b1f_in, c01f, saR0, sbC1, 1, k2, interleave=il, zero_acc=zero_acc,
                     sb_index=sb_index,
                 )
                 a1f = _a1
 
-                wait_barrier(_seg2_vmcnt(kc))
-                il = (
-                    _riffle(
-                        _g2s_thunks(b1_g2s, bc1, b_off, NB),
-                        _s2r_thunks(a_s2r, an0, _a0n, NA, False),
-                    )
-                    + _sc_gather
-                )
+                wait_barrier(_mid_vmcnt(kc))
+                il = _s2r_thunks(a_s2r, an0, _a0n, NA, False) + _sc_gather
                 c10f = mfma.call(
                     a1f, b0f, c10f, saR1, sbC0, 0, k2, interleave=il, zero_acc=zero_acc,
                     sb_index=sb_index,
@@ -490,40 +529,63 @@ def compile_moe_gemm2(
                 a0nf = _a0n
                 il = _riffle(
                     _g2s_thunks(a1_g2s, ac1, a_off, NA),
-                    _s2r_thunks(b_s2r, bn0, _b0n, NB, True)
-                    + _s2r_thunks(b_s2r, bn1, _b1n, NB, True),
+                    _s2r_thunks(b_s2r, bnx[0], _b0n, NB, True)
+                    + _s2r_thunks(b_s2r, bnx[1], _b1n, NB, True),
                 )
                 c11f = mfma.call(
                     a1f, b1f_in, c11f, saR1, sbC1, 1, k2, interleave=il, zero_acc=zero_acc,
                     sb_index=sb_index,
                 )
                 sc_next = (_scn[0], _scn[1], _scn[2], _scn[3])
-                new_bufs = (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)
-                return a0nf, _b0n, _b1n, sc_next, (c00f, c01f, c10f, c11f), new_bufs
+                return a0nf, _b0n, _b1n, sc_next, (c00f, c01f, c10f, c11f), (an0, an1, ac0, ac1)
+
+            def _stage(accs, h, ti):
+                """routing-weighted bf16 of the 16 rows (half ``h``, a-tile ``ti``) x
+                the wave's 128 cols into the staging buffer, 8 B per lane per tile.
+                LDS ops of one wave execute in order: the writes follow the previous
+                flush's reads of the same buffer."""
+                w = row_w[h * NA + ti]
+                for hf in range_constexpr(2):
+                    cq = accs[h * 2 + hf]
+                    for j in range_constexpr(NB):
+                        v = Vec(cq[mfma.idx(ti, j)])
+                        d0 = _bf16x2(fx.Float32(v[0]) * w, fx.Float32(v[1]) * w)
+                        d1 = _bf16x2(fx.Float32(v[2]) * w, fx.Float32(v[3]) * w)
+                        # cols hf*128 + j*16 + 4*g4 of the wave's 128 -> chunk
+                        chunk = fx.Int32(hf * 8 + j * 2) + g4 // 2
+                        _lds_store_vec(
+                            _v2i32(d0, d1), _stg_addr(r16, chunk, g4 % 2), 2
+                        )
+
+            def _flush(nt, h, ti):
+                """the staged 16 rows -> token-major full 128-B lines: lane -> line
+                (row 4k + lane//16, segment hf = (lane//8)%2), 16 B at chunk lane%8,
+                8 lines per store (non-temporal)."""
+                col_wave = (_n_glob(nt) * fx.Int32(BN) + wave_j * (N_TILES_B * 16)) * 2
+                hf_l = (lane_id // 8) % 2
+                ch_l = lane_id % 8
+                _asm_void([], "s_waitcnt lgkmcnt(0)", "")
+                for k in range_constexpr(N_FLUSH):
+                    row = fx.Int32(4 * k) + lane_id // 16
+                    data = _lds_load_vec(_stg_addr(row, hf_l * 8 + ch_l, 0), 4)
+                    buffer_ops.buffer_store(
+                        data,
+                        out_rsrc,
+                        flush_off[(h * NA + ti) * N_FLUSH + k]
+                        + col_wave
+                        + hf_l * fx.Int32(LDS_BLOCK_N * 2)
+                        + ch_l * fx.Int32(16),
+                        offset_is_bytes=True,
+                        cache_modifier=_STORE_CPOL,
+                    )
 
             def _epilogue(nt, accs):
-                """routing-weighted bf16 rows of n-tile ``nt``, token-major"""
-                col0 = (_n_glob(nt) * fx.Int32(BN) + wave_j * (N_TILES_B * 16)) * 2
-                for q in range_constexpr(4):  # c00, c01, c10, c11
-                    h, hf = q // 2, q % 2
+                for h in range_constexpr(2):
                     for ti in range_constexpr(NA):
-                        w = row_w[h * NA + ti]
-                        for j in range_constexpr(NB):
-                            v = Vec(accs[q][mfma.idx(ti, j)])
-                            d0 = _bf16x2(fx.Float32(v[0]) * w, fx.Float32(v[1]) * w)
-                            d1 = _bf16x2(fx.Float32(v[2]) * w, fx.Float32(v[3]) * w)
-                            off = out_off[h * NA + ti] + col0 + fx.Int32(
-                                (hf * LDS_BLOCK_N + j * 16) * 2
-                            ) + g4 * fx.Int32(8)
-                            buffer_ops.buffer_store(
-                                _v2i32(d0, d1),
-                                out_rsrc,
-                                off,
-                                offset_is_bytes=True,
-                                cache_modifier=_STORE_CPOL,
-                            )
+                        _stage(accs, h, ti)
+                        _flush(nt, h, ti)
 
-            bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
+            abufs0 = (a_cur0, a_cur1, a_next0, a_next1)
             n_a = 2 * NA
             n_b = 2 * NB
             n_sc = 2 * (NA // 2) + 2 * (NB // 2)
@@ -552,7 +614,7 @@ def compile_moe_gemm2(
                 off += n_b
                 sc = _unflat_sc(state[off : off + n_sc])
                 accs = ([None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS)
-                bufs = bufs0
+                abufs = abufs0
                 # the gather of step 1 (block 2 of this tile) needs this tile's scale
                 # base; from step 2 on the gathers belong to n-tile nt + 1. Both are
                 # (re)computed from the loop value: the loop body is emitted once.
@@ -560,7 +622,9 @@ def compile_moe_gemm2(
                 for kc in range_constexpr(K_ITERS):
                     if const_expr(kc == 2):
                         _set_scale_tile(nt + fx.Int32(1))
-                    a0f, b0f, b1f, sc, accs, bufs = _one_step(nt, kc, a0f, b0f, b1f, sc, accs, bufs)
+                    a0f, b0f, b1f, sc, accs, abufs = _one_step(
+                        nt, kc, a0f, b0f, b1f, sc, accs, abufs
+                    )
                 _epilogue(nt, accs)
                 state = yield _flat_frag(a0f) + _flat_frag(b0f) + _flat_frag(b1f) + _flat_sc(sc)
             # the redundant loads of the tile after the last one must land before

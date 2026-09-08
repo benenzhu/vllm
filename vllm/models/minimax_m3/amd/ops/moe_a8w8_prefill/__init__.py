@@ -41,7 +41,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
 
 GEMM1_SWIGLU_ALPHA = 1.702
 GEMM1_SWIGLU_LIMIT = 7.0
-GEMM2_N_SPLIT = 2
+GEMM2_N_SPLIT = 4  # 32768 tokens: 1285 -> 1088 us with the rotated sweep; 4096 unchanged
 _GEMM1_BLOCK_K = 128
 _GEMM2_INTERMEDIATE = 768
 
@@ -126,10 +126,8 @@ def a8w8_prefill_moe(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
     )
-    # topk scratch rows after the real ones: gemm2 writes the padded sorted rows
-    # there (all its stores are in bounds)
     partial = torch.empty(
-        ((n_tokens + 1) * topk, hidden_size), dtype=torch.bfloat16, device=device
+        (n_tokens * topk, hidden_size), dtype=torch.bfloat16, device=device
     )
     num_m_blocks2 = (num_m_blocks * bm) // 128
     grid2 = gemm2_grid(num_m_blocks2, GEMM2_N_SPLIT)
@@ -152,11 +150,7 @@ def a8w8_prefill_moe(
     if out is None:
         out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=device)
     _run_moe_reduction(
-        partial[: n_tokens * topk].view(n_tokens, topk, hidden_size),
-        out,
-        n_tokens,
-        topk,
-        hidden_size,
+        partial.view(n_tokens, topk, hidden_size), out, n_tokens, topk, hidden_size
     )
     return out
 
