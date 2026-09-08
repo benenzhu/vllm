@@ -50,10 +50,13 @@ CHUNK_K = 128  # K per A load chunk (256 B of bf16 per row, one dwordx4 per lane
 # of 16 columns -- twice the workgroups of the a16w4 tile (TILE_N 32, 2 x 2),
 # 1-8% faster at M=1..128 from finer balance of the W streams across CUs (2 A
 # chunks per batch = 67 KB LDS, 2 workgroups per CU, best from M=5 and at M=1;
-# 1 chunk, 4 per CU, at M=2..3); M=4 alone keeps the 32-column tile. Above 128,
-# four N-waves of 16 columns with 3 waves per EU. W ring 3 tiles deep,
-# non-temporal W. The kernel is compiled per batch size anyway (inline sort).
-LARGE_M_TOKENS = 128
+# 1 chunk, 4 per CU, at M=2..3); M=4 alone keeps the 32-column tile. The same
+# 16-column tile also wins at M=192..256 (chain 306 -> 296 us at 192, 313 -> 309
+# at 256: the 64-column 1-round grid leaves a 35%-full second round), so the
+# four-N-wave 64-column tile with 3 waves per EU only remains for lab sweeps
+# (``large_m=True``). W ring 3 tiles deep, non-temporal W. The kernel is
+# compiled per batch size anyway (inline sort).
+LARGE_M_TOKENS = 256
 LARGE_M_TILE = (64, 1, 2, 3)
 
 
