@@ -42,6 +42,12 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
 GEMM1_SWIGLU_ALPHA = 1.702
 GEMM1_SWIGLU_LIMIT = 7.0
 GEMM2_N_SPLIT = 4  # 32768 tokens: 1285 -> 1088 us with the rotated sweep; 4096 unchanged
+# gemm2 output mode (see gemm2.compile_moe_gemm2): "bf16" = token-major bf16
+# partials + aiter's moe_reduction (deterministic, the default); "atomic" = bf16
+# atomics into the output, no reduction (aiter's own way; sum order not
+# deterministic); "fp8" = MXFP8 partials + reduce_fp8 (deterministic, half the
+# partial traffic, one more quantization). The caller picks per call.
+GEMM2_OUT_MODE = "bf16"
 _GEMM1_BLOCK_K = 128
 _GEMM2_INTERMEDIATE = 768
 
@@ -75,7 +81,12 @@ def _get_gemm1(
 
 @functools.cache
 def _get_gemm2(
-    hidden_size: int, intermediate_size: int, num_experts: int, topk: int, block_m: int
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    block_m: int,
+    out_mode: str,
 ):
     from .gemm2 import compile_moe_gemm2
 
@@ -86,7 +97,15 @@ def _get_gemm2(
         topk=topk,
         n_split=GEMM2_N_SPLIT,
         sort_block_m=block_m,
+        out_mode=out_mode,
     )
+
+
+@functools.cache
+def _get_reduce_fp8(hidden_size: int, topk: int):
+    from .reduce_fp8 import compile_moe_reduce_fp8
+
+    return compile_moe_reduce_fp8(H=hidden_size, topk=topk)
 
 
 def a8w8_prefill_moe(
@@ -102,15 +121,19 @@ def a8w8_prefill_moe(
     intermediate_size: int,
     num_experts: int,
     out: torch.Tensor | None = None,
+    out_mode: str | None = None,
 ) -> torch.Tensor:
     """One MoE layer for ``MIN_PREFILL_TOKENS <= M <= MAX_PREFILL_TOKENS``:
-    stage 1 (sort, aiter fp8 quant, tile map, gemm1), gemm2 writing the
-    routing-weighted bf16 partials ``[M, topk, H]``, aiter's top-k reduction.
-    Returns ``[M, hidden_size]`` bf16."""
+    stage 1 (sort, aiter fp8 quant, tile map, gemm1), then gemm2 + the reduction
+    of ``out_mode`` (default ``GEMM2_OUT_MODE``): "bf16" partials + aiter's
+    top-k reduction, "atomic" adds into a zeroed output, "fp8" partials +
+    ``reduce_fp8``. Returns ``[M, hidden_size]`` bf16."""
     from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-    from .gemm2 import gemm2_grid
+    from .gemm2 import OUT_MODES, gemm2_grid
 
+    out_mode = GEMM2_OUT_MODE if out_mode is None else out_mode
+    assert out_mode in OUT_MODES, out_mode
     n_tokens = x.shape[0]
     topk = topk_ids.shape[1]
     device = x.device
@@ -126,18 +149,32 @@ def a8w8_prefill_moe(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
     )
-    partial = torch.empty(
-        (n_tokens * topk, hidden_size), dtype=torch.bfloat16, device=device
-    )
+    if out is None:
+        out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=device)
+    if out_mode == "atomic":
+        out.zero_()
+        gemm2_out = out
+        partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
+    elif out_mode == "fp8":
+        gemm2_out = torch.empty((n_tokens * topk, hidden_size), dtype=torch.uint8, device=device)
+        partial_scale = torch.empty(
+            (n_tokens * topk * (hidden_size // 32),), dtype=torch.uint8, device=device
+        )
+    else:
+        gemm2_out = torch.empty(
+            (n_tokens * topk, hidden_size), dtype=torch.bfloat16, device=device
+        )
+        partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
     num_m_blocks2 = (num_m_blocks * bm) // 128
     grid2 = gemm2_grid(num_m_blocks2, GEMM2_N_SPLIT)
     _run_compiled(
-        _get_gemm2(hidden_size, intermediate_size, num_experts, topk, bm),
+        _get_gemm2(hidden_size, intermediate_size, num_experts, topk, bm, out_mode),
         h_q.view(-1),
         _u8_flat(w2),
-        partial.view(-1),
+        _u8_flat(gemm2_out),
         h_s,
         _u8_flat(w2_scale),
+        partial_scale,
         bufs.sorted_ids,
         bufs.sorted_expert_ids,
         bufs.sorted_weights,
@@ -147,10 +184,21 @@ def a8w8_prefill_moe(
         grid2,
         stream,
     )
-    if out is None:
-        out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=device)
+    if out_mode == "atomic":
+        return out
+    if out_mode == "fp8":
+        _run_compiled(
+            _get_reduce_fp8(hidden_size, topk),
+            gemm2_out.view(-1),
+            partial_scale,
+            topk_weights.to(torch.float32).contiguous().view(-1),
+            out.view(-1),
+            n_tokens,
+            stream,
+        )
+        return out
     _run_moe_reduction(
-        partial.view(n_tokens, topk, hidden_size), out, n_tokens, topk, hidden_size
+        gemm2_out.view(n_tokens, topk, hidden_size), out, n_tokens, topk, hidden_size
     )
     return out
 

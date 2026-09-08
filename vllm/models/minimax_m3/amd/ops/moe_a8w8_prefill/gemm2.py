@@ -38,12 +38,15 @@ Layouts (bytes):
   W2        [E, H, I]                    aiter shuffle_weight (16 x 64 K blocks)
   W2_sc     [E*H/32, I/256, 4, 16] dwords aiter shuffle_scale
   sorted_w  [num_m_blocks*BM]            f32 routing weight per sorted row
-  OUT       [n_tokens*topk, H]           bf16
+  OUT       [n_tokens*topk, H]           bf16 ("bf16"), fp8 ("fp8"); [n_tokens, H] bf16 ("atomic")
+  OUT_sc    [n_tokens*topk, H/32]        e8m0 ("fp8"; any buffer otherwise)
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
+from flydsl._mlir import ir as _ir
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
@@ -56,6 +59,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill.gemm1 import (
     S2RLoaderFp4,
     ScaleGatherMoE,
     ScaleLoaderLDS,
+    _as_f32,
     _asm_void,
     _Buf,
     _divmod_nonneg,
@@ -63,6 +67,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill.gemm1 import (
     _g2s_thunks,
     _riffle,
     _s2r_thunks,
+    _permlane16_swap,
     _swizzled_col,
     _unflat_frag,
     wait_barrier,
@@ -71,12 +76,37 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill.gemm2 import (
     _NUM_XCDS,
     _STORE_CPOL,
     _bf16x2,
+    _cvt_pk_fp8,
+    _lds_load_i32,
     _lds_load_vec,
     _lds_store_vec,
+    _maxf_nn,
+    _undef_i32,
     _v2i32,
 )
 
-from .gemm1 import BLOCK_K, Mfma16x16x128Fp8
+from .gemm1 import BLOCK_K, Mfma16x16x128Fp8, _e8m0_roundup_fp8, _fmax
+
+OUT_MODES = ("bf16", "atomic", "fp8")
+
+
+def _atomic_pk_add_bf16(ptr, byte_off, packed_i32):
+    """global_atomic_pk_add_bf16 at ``ptr + byte_off``: adds two bf16 (packed in an
+    i32) into the output row. The one raw LLVM op of the atomic mode (the decode
+    package's epilogue does the same)."""
+    v2bf16 = _ir.VectorType.get([2], _ir.BF16Type.get())
+    val = _llvm.bitcast(v2bf16, fx.as_ir_value(packed_i32))
+    dst = buffer_ops.get_element_ptr(
+        ptr, byte_offset=fx.as_ir_value(byte_off), elem_type=_ir.IntegerType.get_signless(8)
+    )
+    _llvm.AtomicRMWOp(
+        _llvm.AtomicBinOp.fadd,
+        dst,
+        val,
+        _llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+        alignment=4,
+    )
 
 _SCALE_SLOTS2 = 4
 
@@ -90,11 +120,26 @@ def compile_moe_gemm2(
     n_split: int = 2,
     sort_block_m: int = 128,
     rotate: bool = True,
+    out_mode: str = "bf16",
 ):
     """Grouped fp8 gemm2 for one (H, I, E, topk). ``sort_block_m`` (128 / 256) is
     the ``moe_sorting`` block of the inputs; the kernel tiles 128 rows and skips the
     all-padding halves of a 256-sort. ``rotate``: the rotated n-tile sweep inside
-    long same-expert runs (off: every CTA sweeps from its chunk's first n-tile)."""
+    long same-expert runs (off: every CTA sweeps from its chunk's first n-tile).
+
+    ``out_mode`` (the switch the a4w4 kernel has as ``out_dtype``):
+      "bf16"    OUT [n_tokens*topk, H] bf16 = y * routing weight, token-major
+                partials for aiter's ``moe_reduction_kernel``; deterministic.
+      "atomic"  OUT [n_tokens, H] bf16, zeroed by the caller: y * weight added with
+                ``global_atomic_pk_add_bf16`` (what aiter's own stage 2 does); no
+                partials, no reduction, but the sum order is not deterministic.
+      "fp8"     OUT [n_tokens*topk, H] fp8 e4m3 + OUT_scale [n_tokens*topk, H/32]
+                e8m0 (unweighted, per 32 columns, ceil_pow2(amax/448)); the routing
+                weights are applied by ``reduce_fp8.py``. Half the partial traffic
+                of "bf16", deterministic, one more quantization of the result.
+    """
+    assert out_mode in OUT_MODES, out_mode
+    MODE = out_mode
     BM = 128
     BN = 256
     K = I
@@ -114,7 +159,9 @@ def compile_moe_gemm2(
     N_ACCUMS = N_TILES_A * N_TILES_B
     NB = N_TILES_B
     NA = N_TILES_A
-    OUT_ROW_BYTES = H * 2
+    OUT_ELEM = 1 if MODE == "fp8" else 2
+    OUT_ROW_BYTES = H * OUT_ELEM
+    OUT_SC_COLS = H // 32  # e8m0 per output row (fp8 mode)
     W2_BYTES = E * H * K
     assert W2_BYTES <= 0xFFFFFFFF
     B_TILE_BYTES = BN * K_BYTES  # one n-tile of W2 (256 rows)
@@ -154,6 +201,7 @@ def compile_moe_gemm2(
         OUT: fx.Tensor,
         A_scale: fx.Tensor,
         W2_scale: fx.Tensor,
+        OUT_scale: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -281,9 +329,16 @@ def compile_moe_gemm2(
                 W2, max_size=False, num_records_bytes=W2_BYTES
             )
             # padded sorted rows (tok == n_tokens) fall outside the resource: dropped
+            # (atomic mode: OUT is [n_tokens, H]; the row predicate does the same)
+            out_rows = n_tokens if MODE == "atomic" else n_tokens * fx.Int32(topk)
             out_rsrc = buffer_ops.create_buffer_resource(
-                OUT, max_size=False, num_records_bytes=n_tokens * (topk * OUT_ROW_BYTES)
+                OUT, max_size=False, num_records_bytes=out_rows * OUT_ROW_BYTES
             )
+            osc_rsrc = buffer_ops.create_buffer_resource(
+                OUT_scale, max_size=False, num_records_bytes=out_rows * OUT_SC_COLS
+            )
+            if const_expr(MODE == "atomic"):
+                out_ptr = buffer_ops.create_llvm_ptr(buffer_ops.extract_base_index(OUT, 1), 1)
 
             # ---- A rows (sorted, contiguous): row * K_BYTES + swizzled col ----
             def _a_offsets(half):
@@ -371,6 +426,8 @@ def compile_moe_gemm2(
             def _orow(sid):
                 tok = sid & fx.Int32(0x00FFFFFF)  # padded: tok == n_tokens -> OOB
                 slot = (sid >> 24) & fx.Int32(0xFF)
+                if const_expr(MODE == "atomic"):
+                    return tok
                 return tok * fx.Int32(topk) + slot
 
             # routing weight of the lane's own rows (row half h, tile ti, r16) and the
@@ -378,6 +435,8 @@ def compile_moe_gemm2(
             # staged row 4k + lane//16)
             wave_row0 = m_base + wave_i * (N_TILES_A * 16)
             row_w = []
+            own_off = []  # output byte offset of the lane's own rows (atomic / fp8)
+            own_valid = []
             for h in range_constexpr(2):
                 for ti in range_constexpr(N_TILES_A):
                     row = wave_row0 + fx.Int32(h * LDS_BLOCK_M + ti * 16) + r16
@@ -388,7 +447,13 @@ def compile_moe_gemm2(
                             )
                         )
                     )
+                    sid = fx.Int32(
+                        buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=fx.Int32)
+                    )
+                    own_off.append(_orow(sid))
+                    own_valid.append((sid & fx.Int32(0x00FFFFFF)) < n_tokens)
             flush_off = []
+            flush_valid = []
             for h in range_constexpr(2):
                 for ti in range_constexpr(NA):
                     for k in range_constexpr(N_FLUSH):
@@ -397,6 +462,7 @@ def compile_moe_gemm2(
                             buffer_ops.buffer_load(ids_rsrc, row, vec_width=1, dtype=fx.Int32)
                         )
                         flush_off.append(_orow(sid) * fx.Int32(OUT_ROW_BYTES))
+                        flush_valid.append((sid & fx.Int32(0x00FFFFFF)) < n_tokens)
             stg_base = fx.Int32(fx.ptrtoint(_stg_ptr)) + wave_id * fx.Int32(STG_WAVE)
 
             def _stg_addr(row, chunk, half):
@@ -579,11 +645,96 @@ def compile_moe_gemm2(
                         cache_modifier=_STORE_CPOL,
                     )
 
-            def _epilogue(nt, accs):
+            def _epilogue_atomic(nt, accs):
+                """y * weight added into OUT[tok, :] with ``global_atomic_pk_add_bf16``:
+                the rows are staged in LDS like the bf16 mode, then flushed so that 8
+                consecutive lanes add 8 consecutive dwords of one 128-B line (4
+                instructions per line; straight from the accumulators the 16 rows of
+                a tile spread every instruction over 16 lines and the chain ran 2x
+                slower than the bf16 partials). Padded rows are skipped."""
+                col_wave = (_n_glob(nt) * fx.Int32(BN) + wave_j * (N_TILES_B * 16)) * 2
+                hf_l = (lane_id // 8) % 2
+                dw_l = lane_id % 8
                 for h in range_constexpr(2):
                     for ti in range_constexpr(NA):
                         _stage(accs, h, ti)
-                        _flush(nt, h, ti)
+                        _asm_void([], "s_waitcnt lgkmcnt(0)", "")
+                        for k in range_constexpr(N_FLUSH):
+                            row = fx.Int32(4 * k) + lane_id // 16
+                            base = (
+                                flush_off[(h * NA + ti) * N_FLUSH + k]
+                                + col_wave
+                                + hf_l * fx.Int32(LDS_BLOCK_N * 2)
+                                + dw_l * fx.Int32(4)
+                            )
+                            for d in range_constexpr(4):
+                                # dword dw_l + 8d of the line: chunk (dw_l + 8d)//4 = 2d +
+                                # dw_l//4, dword dw_l%4 in it
+                                chunk = fx.Int32(2 * d) + dw_l // 4
+                                addr = _stg_addr(row, hf_l * 8 + chunk, 0) + (dw_l % 4) * 4
+                                val = _lds_load_i32(addr)
+                                if flush_valid[(h * NA + ti) * N_FLUSH + k]:
+                                    _atomic_pk_add_bf16(out_ptr, base + fx.Int32(32 * d), val)
+
+            def _epilogue_fp8(nt, accs):
+                """unweighted y -> fp8 per 32-col group (e8m0 = ceil_pow2(amax/448)),
+                8 B per lane after a permlane16 swap (gemm1's epilogue), the two e8m0
+                bytes of a (row, 64-col half) as one 16-bit store from lane group 0"""
+                colbase = _n_glob(nt) * fx.Int32(BN) + wave_j * (N_TILES_B * 16)
+                for q in range_constexpr(4):
+                    h, hf = q // 2, q % 2
+                    for ti in range_constexpr(NA):
+                        row_off = own_off[h * NA + ti]  # tok*topk + slot
+                        e8_of_p = []
+                        for p in range_constexpr(NB // 2):
+                            gv = Vec(accs[q][mfma.idx(ti, 2 * p)])
+                            gw = Vec(accs[q][mfma.idx(ti, 2 * p + 1)])
+                            hv = [fx.Float32(gv[v]) for v in range(4)] + [
+                                fx.Float32(gw[v]) for v in range(4)
+                            ]
+                            amax = _maxf_nn(fx.math.absf(hv[0]), fx.math.absf(hv[1]))
+                            for v in range_constexpr(2, 8):
+                                amax = _maxf_nn(amax, fx.math.absf(hv[v]))
+                            amax = _fmax(amax, amax.shuffle_xor(16, 64))
+                            amax = _fmax(amax, amax.shuffle_xor(32, 64))
+                            e8m0 = _e8m0_roundup_fp8(amax)
+                            scale_f = _as_f32(e8m0 << 23)
+                            da = _cvt_pk_fp8(_undef_i32(), hv[0], hv[1], scale_f, False)
+                            da = _cvt_pk_fp8(da, hv[2], hv[3], scale_f, True)
+                            db = _cvt_pk_fp8(_undef_i32(), hv[4], hv[5], scale_f, False)
+                            db = _cvt_pk_fp8(db, hv[6], hv[7], scale_f, True)
+                            da, db = _permlane16_swap(da, db)
+                            # lane group g holds tile (2p + g%2), cols (g//2)*8 .. +8
+                            col = colbase + fx.Int32(hf * LDS_BLOCK_N + 2 * p * 16) + (g4 % 2) * 16 + (g4 // 2) * 8
+                            buffer_ops.buffer_store(
+                                _v2i32(da, db),
+                                out_rsrc,
+                                row_off * fx.Int32(OUT_ROW_BYTES) + col,
+                                offset_is_bytes=True,
+                            )
+                            e8_of_p.append(e8m0)
+                        # the two 32-col groups of this (row, half): one 16-bit store
+                        # from lane group 0 (the group index is even: 2-byte aligned)
+                        colgrp = (colbase + fx.Int32(hf * LDS_BLOCK_N)) // 32
+                        pair16 = fx.Int32(e8_of_p[0] | (e8_of_p[1] << 8)).to(fx.Int16)
+                        buffer_ops.buffer_store(
+                            pair16,
+                            osc_rsrc,
+                            row_off * fx.Int32(OUT_SC_COLS) + colgrp,
+                            mask=fx.as_ir_value(g4 == fx.Int32(0)),
+                            offset_is_bytes=True,
+                        )
+
+            def _epilogue(nt, accs):
+                if const_expr(MODE == "atomic"):
+                    _epilogue_atomic(nt, accs)
+                elif const_expr(MODE == "fp8"):
+                    _epilogue_fp8(nt, accs)
+                else:
+                    for h in range_constexpr(2):
+                        for ti in range_constexpr(NA):
+                            _stage(accs, h, ti)
+                            _flush(nt, h, ti)
 
             abufs0 = (a_cur0, a_cur1, a_next0, a_next1)
             n_a = 2 * NA
@@ -638,6 +789,7 @@ def compile_moe_gemm2(
         OUT: fx.Tensor,
         A_scale: fx.Tensor,
         W2_scale: fx.Tensor,
+        OUT_scale: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
@@ -653,6 +805,7 @@ def compile_moe_gemm2(
             OUT,
             A_scale,
             W2_scale,
+            OUT_scale,
             sorted_ids,
             sorted_expert_ids,
             sorted_weights,

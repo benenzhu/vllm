@@ -93,7 +93,7 @@ def m3_weights():
     return raw, rocm_aiter_ops.shuffle_mxfp8_moe_weights(w13_q, w2_q, w13_s, w2_s)
 
 
-def _run(shuffled, x, topk_ids, topk_weights):
+def _run(shuffled, x, topk_ids, topk_weights, out_mode="bf16"):
     from vllm.models.minimax_m3.amd.ops.moe_a8w8_prefill import a8w8_prefill_moe
 
     w13, w2, w13_s, w2_s = shuffled
@@ -108,6 +108,7 @@ def _run(shuffled, x, topk_ids, topk_weights):
         hidden_size=HIDDEN,
         intermediate_size=INTER,
         num_experts=NUM_EXPERTS,
+        out_mode=out_mode,
     )
 
 
@@ -137,6 +138,18 @@ def _run_aiter(shuffled, x, topk_ids, topk_weights):
 def test_a8w8_prefill_moe_matches_aiter(m3_weights, m):
     """3072/4096: 128-row sort blocks; 16384: 256-row blocks (gemm1 BM256,
     gemm2 skipping the all-padding 128-row tiles)."""
+    _check(m3_weights, m, "bf16")
+
+
+@pytest.mark.parametrize("out_mode", ["atomic", "fp8"])
+def test_a8w8_prefill_moe_out_modes(m3_weights, out_mode):
+    """gemm2's other output modes: bf16 atomics into the output (aiter's own way,
+    sum order not deterministic) and fp8 partials + reduce_fp8 (deterministic,
+    one more quantization)."""
+    _check(m3_weights, 4096, out_mode)
+
+
+def _check(m3_weights, m, out_mode):
     from vllm.models.minimax_m3.amd.ops.moe_a8w8_prefill import (
         block_m_for,
         supports_shapes,
@@ -150,24 +163,30 @@ def test_a8w8_prefill_moe_matches_aiter(m3_weights, m):
     x = torch.randn((m, HIDDEN), dtype=torch.bfloat16, device=device)
     topk_ids, topk_weights = _routing(m, device)
 
-    out = _run(shuffled, x, topk_ids, topk_weights)
-    out2 = _run(shuffled, x, topk_ids, topk_weights)
+    out = _run(shuffled, x, topk_ids, topk_weights, out_mode)
+    out2 = _run(shuffled, x, topk_ids, topk_weights, out_mode)
     ref_aiter = _run_aiter(shuffled, x, topk_ids, topk_weights)
     torch.cuda.synchronize()
     assert out.shape == (m, HIDDEN) and out.dtype == torch.bfloat16
-    # deterministic: the same inputs give the same bits (a race shows up here)
-    assert torch.equal(out, out2)
+    if out_mode != "atomic":
+        # deterministic: the same inputs give the same bits (a race shows up here)
+        assert torch.equal(out, out2)
+    else:
+        assert _cos(out, out2) > 0.99999
     # aiter's a8w8 chain quantizes x and the intermediate the same way but its
-    # stage 2 accumulates with bf16 atomics: cos 0.99999, not bit-identical
-    assert _cos(out, ref_aiter) > 0.9999
+    # stage 2 accumulates with bf16 atomics: cos 0.99999, not bit-identical; the
+    # fp8 partials add one more quantization (cos ~0.9985)
+    assert _cos(out, ref_aiter) > (0.998 if out_mode == "fp8" else 0.9999)
     # both are ~0.999 to the float reference (the fp8 activation quant
-    # dominates); ours must be as close as aiter's own kernels
+    # dominates); ours must be as close as aiter's own kernels (fp8 mode: a
+    # little further, by its extra quantization)
     tokens = torch.randperm(m, device=device)[:CHECK_TOKENS].tolist()
     ref = _float_reference(x, raw, topk_ids, topk_weights, tokens)
     ours = out[tokens].float()
     theirs = ref_aiter[tokens].float()
-    assert _cos(ours, ref) > 0.998
-    assert _cos(ours, ref) >= _cos(theirs, ref) - 1e-3
+    slack = 2e-3 if out_mode == "fp8" else 1e-3
+    assert _cos(ours, ref) > 0.997
+    assert _cos(ours, ref) >= _cos(theirs, ref) - slack
     err_ours = (ours - ref).abs().max().item()
     err_theirs = (theirs - ref).abs().max().item()
-    assert err_ours <= err_theirs * 1.1 + 1e-3, (err_ours, err_theirs)
+    assert err_ours <= err_theirs * (2.0 if out_mode == "fp8" else 1.1) + 1e-3, (err_ours, err_theirs)
