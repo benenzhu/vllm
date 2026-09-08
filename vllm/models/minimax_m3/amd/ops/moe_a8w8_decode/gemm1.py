@@ -60,15 +60,23 @@ def compile_gemm1(
     TOPK,
     n_tokens,
     inline_sort=False,
+    large_m=None,
+    prefetch=None,
+    waves_per_eu=None,
 ):
     """Kernel for batches of up to ``n_tokens`` tokens: only the tile choice and the
     inline-sort scan length depend on it, so different ``n_tokens`` often give the
     same kernel (``launch.kernel_name``). ``launch.tile_n`` is the N tile for the
-    grid."""
-    large_m = n_tokens > LARGE_M_TOKENS
-    TILE_N, KW, waves_per_eu = (64, 1, 3) if large_m else (32, 2, None)
+    grid. ``large_m`` / ``prefetch`` / ``waves_per_eu`` override the defaults for
+    lab sweeps only (the kernel name carries them)."""
+    if large_m is None:
+        large_m = n_tokens > LARGE_M_TOKENS
+    TILE_N, KW, wpe = (64, 1, 3) if large_m else (32, 2, None)
+    if waves_per_eu is None:
+        waves_per_eu = wpe
     KB = 2  # A chunks per batch through LDS
-    prefetch = 3  # W tiles in flight
+    if prefetch is None:
+        prefetch = 3  # W tiles in flight
     b_cache_mod = 2  # non-temporal W loads
     K, INTER = D_HIDDEN, D_INTER
     N_OUT = 2 * INTER
