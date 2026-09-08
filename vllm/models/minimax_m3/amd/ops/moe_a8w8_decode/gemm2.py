@@ -48,10 +48,12 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
 from .utils import _fp8x8_to_bf16
 
 BM = 16
-# Tiles from the a16w4 MI355X sweeps: 256 output columns x 256 K per workgroup.
-# Split-K 3 up to KSPLIT_SMALL_M_TOKENS is worth ~1.5 us of latency hiding; at 256
-# tokens it costs ~5 us of extra atomics, so larger batches run unsplit.
-TILE_N = 256
+# Tiles: 128 output columns x 256 K per workgroup (MI355X 09-09 sweep: twice the
+# workgroups of the a16w4 256-column tile, 0.5-1 us faster at every M by better
+# balance across CUs). Split-K 3 up to KSPLIT_SMALL_M_TOKENS is worth ~1.5 us of
+# latency hiding; at 256 tokens it costs ~5 us of extra atomics, so larger batches
+# run unsplit.
+TILE_N = 128
 TILE_K = 256
 BLOCK_K = 64  # K per 1 KB W block (16 columns)
 KSPLIT_SMALL_M = 3

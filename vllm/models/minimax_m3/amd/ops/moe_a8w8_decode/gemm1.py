@@ -45,11 +45,24 @@ NW = 4  # waves per workgroup
 LDS_PAD = 16  # bytes of padding per LDS row: conflict-free 16 B reads
 TILE_K = 64  # K per W tile (one 1 KB block per 16 columns)
 CHUNK_K = 128  # K per A load chunk (256 B of bf16 per row, one dwordx4 per lane)
-# Tiles from the a16w4 MI355X sweeps (same A/LDS traffic, W tiles half the K): up to
-# LARGE_M_TOKENS two N-waves x two K-waves of 16 columns (TILE_N 32); above, four
-# N-waves of 16 columns (TILE_N 64) with 3 waves per EU. A batches of 2 chunks,
-# W ring 3 tiles deep, non-temporal W.
+# Tiles (TILE_N, K-waves, A chunks per batch, waves per EU), MI355X chain sweep of
+# 09-09 at every decode batch size: up to LARGE_M_TOKENS one N-wave x four K-waves
+# of 16 columns -- twice the workgroups of the a16w4 tile (TILE_N 32, 2 x 2),
+# 1-8% faster at M=1..128 from finer balance of the W streams across CUs (2 A
+# chunks per batch = 67 KB LDS, 2 workgroups per CU, best from M=5 and at M=1;
+# 1 chunk, 4 per CU, at M=2..3); M=4 alone keeps the 32-column tile. Above 128,
+# four N-waves of 16 columns with 3 waves per EU. W ring 3 tiles deep,
+# non-temporal W. The kernel is compiled per batch size anyway (inline sort).
 LARGE_M_TOKENS = 128
+LARGE_M_TILE = (64, 1, 2, 3)
+
+
+def small_m_tile(n_tokens):
+    if n_tokens == 4:
+        return (32, 2, 1, None)
+    if 2 <= n_tokens <= 3:
+        return (16, 4, 1, None)
+    return (16, 4, 2, None)
 
 
 def compile_gemm1(
@@ -71,10 +84,9 @@ def compile_gemm1(
     lab sweeps only (the kernel name carries them)."""
     if large_m is None:
         large_m = n_tokens > LARGE_M_TOKENS
-    TILE_N, KW, wpe = (64, 1, 3) if large_m else (32, 2, None)
+    TILE_N, KW, KB, wpe = LARGE_M_TILE if large_m else small_m_tile(n_tokens)
     if waves_per_eu is None:
         waves_per_eu = wpe
-    KB = 2  # A chunks per batch through LDS
     if prefetch is None:
         prefetch = 3  # W tiles in flight
     b_cache_mod = 2  # non-temporal W loads
@@ -375,10 +387,11 @@ def compile_gemm1(
                     abuf = None
 
             if const_expr(KW > 1):
-                # K-reduce: K-wave 1 parks its partial sums in the (now free) A slots,
-                # K-wave 0 adds them and runs the epilogue alone
+                # K-reduce: K-wave k > 0 parks its partial sums in slot k - 1 of the
+                # (now free) A region, K-wave 0 adds them and runs the epilogue alone
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
+                RED_SLOT = NWN * 2 * NI * 64  # 16 B tiles parked per K-wave
                 red = [
                     [
                         ((wave_n * 2 + gu) * NI + ni) * 64 + lane
@@ -387,10 +400,11 @@ def compile_gemm1(
                     for gu in range_constexpr(2)
                 ]
                 if wave_k > 0:
+                    park = (wave_k - 1) * RED_SLOT
                     for gu in range_constexpr(2):
                         for ni in range_constexpr(NI):
                             lds_store16(
-                                red[gu][ni], acc[gu][ni].load().bitcast(fx.Int32)
+                                red[gu][ni] + park, acc[gu][ni].load().bitcast(fx.Int32)
                             )
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
@@ -398,13 +412,15 @@ def compile_gemm1(
                     for gu in range_constexpr(2):
                         for ni in range_constexpr(NI):
                             v = acc[gu][ni].load()
-                            pv = lds_load16(red[gu][ni]).bitcast(fx.Float32)
-                            acc[gu][ni].store(
-                                fx.Vector.from_elements(
+                            for kw in range_constexpr(KW - 1):
+                                pv = lds_load16(red[gu][ni] + kw * RED_SLOT).bitcast(
+                                    fx.Float32
+                                )
+                                v = fx.Vector.from_elements(
                                     [v[i] + pv[i] for i in range_constexpr(4)],
                                     fx.Float32,
                                 )
-                            )
+                            acc[gu][ni].store(v)
 
             # epilogue: swigluoai(gate, up) -> bf16 [sorted_row, inter], padding masked
             neg_limit = -f32_limit
