@@ -40,7 +40,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
 
 from .utils import _fp8x8_to_bf16
 
-BM = 16  # rows per m-block (one MFMA M tile)
+BM = 16  # default rows per m-block (one MFMA M tile); compile_gemm1(BM=32) runs two
 NW = 4  # waves per workgroup
 LDS_PAD = 16  # bytes of padding per LDS row: conflict-free 16 B reads
 TILE_K = 64  # K per W tile (one 1 KB block per 16 columns)
@@ -79,12 +79,18 @@ def compile_gemm1(
     large_m=None,
     prefetch=None,
     waves_per_eu=None,
+    BM=BM,
 ):
     """Kernel for batches of up to ``n_tokens`` tokens: only the tile choice and the
     inline-sort scan length depend on it, so different ``n_tokens`` often give the
     same kernel (``launch.kernel_name``). ``launch.tile_n`` is the N tile for the
-    grid. ``large_m`` / ``prefetch`` / ``waves_per_eu`` override the defaults for
-    lab sweeps only (the kernel name carries them)."""
+    grid. ``BM`` (16 or 32) is the sort's row block: at 32 every W fragment a wave
+    unpacks feeds two 16-row MFMA tiles, so an expert with more than 16 rows
+    streams its weights half as often. ``large_m`` / ``prefetch`` /
+    ``waves_per_eu`` override the defaults for lab sweeps only (the kernel name
+    carries them)."""
+    assert BM in (16, 32), BM
+    RT = BM // 16  # 16-row MFMA tiles per block
     if large_m is None:
         large_m = n_tokens > LARGE_M_TOKENS
     TILE_N, KW, KB, wpe = LARGE_M_TILE if large_m else small_m_tile(n_tokens)
@@ -109,7 +115,7 @@ def compile_gemm1(
     RS = ROWB + LDS_PAD  # LDS row stride
     KSLOT = BM * RS  # one K-wave's batch
     SLOT = KW * KSLOT
-    RED_BYTES = (KW - 1) * NWN * 2 * NI * 1024  # K-reduce scratch (reuses the A slots)
+    RED_BYTES = (KW - 1) * RT * NWN * 2 * NI * 1024  # K-reduce scratch (reuses the A slots)
     LDS_BYTES = max(2 * SLOT, RED_BYTES)
     # LDS is addressed in 16 B tiles below
     RS_T, KSLOT_T, SLOT_T = RS // 16, KSLOT // 16, SLOT // 16
@@ -125,13 +131,14 @@ def compile_gemm1(
     @fx.struct
     class Shared:
         a: fx.Array[fx.Uint8, LDS_BYTES, 16]  # A slots / K-reduce scratch
-        tab: fx.Array[fx.Int32, 32]  # routing table (inline sort only; 128 B)
+        tab: fx.Array[fx.Int32, 64]  # routing table (inline sort only; BM rows + sentinel)
 
     name = (
         f"m3_gemm1_a16w8_h{K}_i{INTER}_ne{NE}_tn{TILE_N}_kw{KW}_kb{KB}_pf{prefetch}"
         f"_bcm{b_cache_mod}"
         + (f"_w{waves_per_eu}" if waves_per_eu else "")
         + (f"_isort{max_pairs}" if inline_sort else "")
+        + (f"_bm{BM}" if BM != 16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
@@ -181,7 +188,7 @@ def compile_gemm1(
             # block = routing pair mb: expert + rows from a ballot over the pairs
             tab = smem.tab.ptr
             e_pair, owner, _nrows, build_tab = inline_sort_table(
-                arg_mind, i32_ntok, TOPK, mb, lane, tab, max_pairs=max_pairs
+                arg_mind, i32_ntok, TOPK, mb, lane, tab, max_pairs=max_pairs, bm=BM
             )
             if owner:
                 build_tab()
@@ -210,19 +217,26 @@ def compile_gemm1(
             e_sorted = fx.Int32(
                 fx.rocdl.readfirstlane(T.i32, fx.Int32(_global_i32_ptr(arg_eids)[mb]))
             )
-            ld_row_s = wave * 4 + q16
-            ld_tok_s = mind_at(ld_row_s) & 0xFFFFFF
-            ep_tok_s = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+            ld_row_s = [rt * 16 + wave * 4 + q16 for rt in range_constexpr(RT)]
+            ld_tok_s = [mind_at(ld_row_s[rt]) & 0xFFFFFF for rt in range_constexpr(RT)]
+            ep_tok_s = [
+                [mind_at(rt * 16 + q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+                for rt in range_constexpr(RT)
+            ]
             go = mbase < cumsum0
 
         if go:
             if const_expr(inline_sort):
                 e = e_pair
-                # A staging: wave w loads row w*4 + lane//16, 16 B chunk j*16 + lane%16
-                ld_row = wave * 4 + q16
-                ld_tok = mind_at(ld_row) & 0xFFFFFF
-                # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
-                ep_tok = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+                # A staging: per 16-row tile rt wave w loads row rt*16 + w*4 + lane//16,
+                # 16 B chunk j*16 + lane%16
+                ld_row = [rt * 16 + wave * 4 + q16 for rt in range_constexpr(RT)]
+                ld_tok = [mind_at(ld_row[rt]) & 0xFFFFFF for rt in range_constexpr(RT)]
+                # epilogue rows: lane (q16, l16) holds rows rt*16 + q16*4 + ii of column l16
+                ep_tok = [
+                    [mind_at(rt * 16 + q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+                    for rt in range_constexpr(RT)
+                ]
             else:
                 e, ld_row, ld_tok, ep_tok = e_sorted, ld_row_s, ld_tok_s, ep_tok_s
             xr = buffer_ops.create_buffer_resource_from_addr(
@@ -237,48 +251,51 @@ def compile_gemm1(
             outr = buffer_ops.create_buffer_resource_from_addr(
                 arg_out, num_records_bytes=fx.Int64(cumsum0) * (INTER * 2)
             )
-            ld_gdw = (ld_tok * (K * 2) + l16 * 16) // 4
-            ld_tile = ld_row * RS_T + l16
+            ld_gdw = [(ld_tok[rt] * (K * 2) + l16 * 16) // 4 for rt in range_constexpr(RT)]
+            ld_tile = [ld_row[rt] * RS_T + l16 for rt in range_constexpr(RT)]
 
             def load_a_batch(b):
-                # batch b of every K-wave: chunks kw*KCW + b*KB + j; base in an SGPR,
-                # j*256 in the immediate offset field
+                # batch b of every K-wave: chunks kw*KCW + b*KB + j of each row tile;
+                # base in an SGPR, j*256 in the immediate offset field
                 out = []
-                for kw in range_constexpr(KW):
-                    so = (kw * KCW + b * KB) * 256
-                    out += [
-                        fx.Vector(
-                            buffer_ops.buffer_load(
-                                xr,
-                                ld_gdw + j * 64,
-                                vec_width=4,
-                                dtype=fx.Int32,
-                                soffset_bytes=so,
+                for rt in range_constexpr(RT):
+                    for kw in range_constexpr(KW):
+                        so = (kw * KCW + b * KB) * 256
+                        out += [
+                            fx.Vector(
+                                buffer_ops.buffer_load(
+                                    xr,
+                                    ld_gdw[rt] + j * 64,
+                                    vec_width=4,
+                                    dtype=fx.Int32,
+                                    soffset_bytes=so,
+                                )
                             )
-                        )
-                        for j in range_constexpr(KB)
-                    ]
+                            for j in range_constexpr(KB)
+                        ]
                 return out
 
             def stage_a_batch(regs, slot):
-                for kw in range_constexpr(KW):
-                    for j in range_constexpr(KB):
-                        lds_store16(
-                            ld_tile + (slot * SLOT_T + kw * KSLOT_T + j * 16),
-                            regs[kw * KB + j],
-                        )
+                for rt in range_constexpr(RT):
+                    for kw in range_constexpr(KW):
+                        for j in range_constexpr(KB):
+                            lds_store16(
+                                ld_tile[rt] + (slot * SLOT_T + kw * KSLOT_T + j * 16),
+                                regs[(rt * KW + kw) * KB + j],
+                            )
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
 
-            # MFMA A fragment of W tile kt, K-step ku: row l16, chunk kt//2, K
-            # (kt%2)*64 + q16*16 + ku*8 -> 16 B tile (kt%2)*8 + q16*2 + ku of the chunk
+            # MFMA A fragment of W tile kt, K-step ku, row tile rt: row rt*16 + l16,
+            # chunk kt//2, K (kt%2)*64 + q16*16 + ku*8 -> 16 B tile (kt%2)*8 + q16*2
+            # + ku of the chunk
             rd_tile = wave_k * KSLOT_T + l16 * RS_T + q16 * 2
 
-            def read_a(kt, ku):
+            def read_a(kt, ku, rt):
                 c = kt // TPC
                 slot, j, b = (c // KB) % 2, c % KB, kt % TPC
                 return lds_load16(
-                    rd_tile + (slot * SLOT_T + j * 16 + b * 8 + ku)
+                    rd_tile + (rt * 16 * RS_T + slot * SLOT_T + j * 16 + b * 8 + ku)
                 ).bitcast(fx.BFloat16)
 
             # W addressing (gu 0 = gate, 1 = up; gate/up 16-row blocks interleaved), NI
@@ -351,13 +368,17 @@ def compile_gemm1(
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
             acc_layout = fx.make_layout(4, 1)
             acc = [
-                [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(NI)]
-                for _ in range(2)
+                [
+                    [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(NI)]
+                    for _ in range(2)
+                ]
+                for _ in range(RT)
             ]
             zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
-            for gu in range_constexpr(2):
-                for ni in range_constexpr(NI):
-                    acc[gu][ni].store(zero4)
+            for rt in range_constexpr(RT):
+                for gu in range_constexpr(2):
+                    for ni in range_constexpr(NI):
+                        acc[rt][gu][ni].store(zero4)
 
             def _frag(v8):
                 t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
@@ -365,16 +386,23 @@ def compile_gemm1(
                 return t
 
             def compute_tile(bb, sc, kt):
-                a_t = [_frag(read_a(kt, ku)) for ku in range_constexpr(TPC)]
-                # scale byte: 128-K tile (kt//2)%2 of the 256-K group -> +2, gate/up -> +gu
+                a_t = [
+                    [_frag(read_a(kt, ku, rt)) for ku in range_constexpr(TPC)]
+                    for rt in range_constexpr(RT)
+                ]
+                # scale byte: 128-K tile (kt//2)%2 of the 256-K group -> +2, gate/up -> +gu;
+                # one unpacked W fragment feeds every row tile
                 for gu in range_constexpr(2):
                     for ni in range_constexpr(NI):
                         s = _e8m0_byte_to_f32(sc[kt % 2][ni], gu + ((kt // 2) % 2) * 2)
                         for ku in range_constexpr(TPC):
-                            b8 = _fp8x8_to_bf16(
-                                bb[gu][ni][2 * ku], bb[gu][ni][2 * ku + 1], s
+                            b_t = _frag(
+                                _fp8x8_to_bf16(bb[gu][ni][2 * ku], bb[gu][ni][2 * ku + 1], s)
                             )
-                            fx.gemm(mma_atom, acc[gu][ni], a_t[ku], _frag(b8), acc[gu][ni])
+                            for rt in range_constexpr(RT):
+                                fx.gemm(
+                                    mma_atom, acc[rt][gu][ni], a_t[rt][ku], b_t, acc[rt][gu][ni]
+                                )
 
             # pipeline: batch 0 -> LDS, W ring; per tile: (batch loads) W load, LDS
             # read, MFMAs
@@ -400,50 +428,57 @@ def compile_gemm1(
                 # (now free) A region, K-wave 0 adds them and runs the epilogue alone
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
-                RED_SLOT = NWN * 2 * NI * 64  # 16 B tiles parked per K-wave
+                RED_SLOT = RT * NWN * 2 * NI * 64  # 16 B tiles parked per K-wave
                 red = [
                     [
-                        ((wave_n * 2 + gu) * NI + ni) * 64 + lane
-                        for ni in range_constexpr(NI)
+                        [
+                            (((rt * NWN + wave_n) * 2 + gu) * NI + ni) * 64 + lane
+                            for ni in range_constexpr(NI)
+                        ]
+                        for gu in range_constexpr(2)
                     ]
-                    for gu in range_constexpr(2)
+                    for rt in range_constexpr(RT)
                 ]
                 if wave_k > 0:
                     park = (wave_k - 1) * RED_SLOT
-                    for gu in range_constexpr(2):
-                        for ni in range_constexpr(NI):
-                            lds_store16(
-                                red[gu][ni] + park, acc[gu][ni].load().bitcast(fx.Int32)
-                            )
+                    for rt in range_constexpr(RT):
+                        for gu in range_constexpr(2):
+                            for ni in range_constexpr(NI):
+                                lds_store16(
+                                    red[rt][gu][ni] + park,
+                                    acc[rt][gu][ni].load().bitcast(fx.Int32),
+                                )
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.gpu.barrier()
                 if wave_k == 0:
-                    for gu in range_constexpr(2):
-                        for ni in range_constexpr(NI):
-                            v = acc[gu][ni].load()
-                            for kw in range_constexpr(KW - 1):
-                                pv = lds_load16(red[gu][ni] + kw * RED_SLOT).bitcast(
-                                    fx.Float32
-                                )
-                                v = fx.Vector.from_elements(
-                                    [v[i] + pv[i] for i in range_constexpr(4)],
-                                    fx.Float32,
-                                )
-                            acc[gu][ni].store(v)
+                    for rt in range_constexpr(RT):
+                        for gu in range_constexpr(2):
+                            for ni in range_constexpr(NI):
+                                v = acc[rt][gu][ni].load()
+                                for kw in range_constexpr(KW - 1):
+                                    pv = lds_load16(
+                                        red[rt][gu][ni] + kw * RED_SLOT
+                                    ).bitcast(fx.Float32)
+                                    v = fx.Vector.from_elements(
+                                        [v[i] + pv[i] for i in range_constexpr(4)],
+                                        fx.Float32,
+                                    )
+                                acc[rt][gu][ni].store(v)
 
             # epilogue: swigluoai(gate, up) -> bf16 [sorted_row, inter], padding masked
             neg_limit = -f32_limit
 
             def epilogue():
-                for ii in range_constexpr(4):
-                    sorted_row = mbase + q16 * 4 + ii
-                    valid = ep_tok[ii] < i32_ntok
-                    for ni in range_constexpr(NI):
-                        g = acc[0][ni].load()[ii]
-                        u = acc[1][ni].load()[ii]
-                        yb = _swigluoai_f32(g, u, f32_alpha, neg_limit).to(fx.BFloat16)
-                        out_idx = sorted_row * INTER + nbase + ni * 16 + l16
-                        buffer_ops.buffer_store(yb, outr, out_idx, mask=valid)
+                for rt in range_constexpr(RT):
+                    for ii in range_constexpr(4):
+                        sorted_row = mbase + rt * 16 + q16 * 4 + ii
+                        valid = ep_tok[rt][ii] < i32_ntok
+                        for ni in range_constexpr(NI):
+                            g = acc[rt][0][ni].load()[ii]
+                            u = acc[rt][1][ni].load()[ii]
+                            yb = _swigluoai_f32(g, u, f32_alpha, neg_limit).to(fx.BFloat16)
+                            out_idx = sorted_row * INTER + nbase + ni * 16 + l16
+                            buffer_ops.buffer_store(yb, outr, out_idx, mask=valid)
 
             if const_expr(KW > 1):
                 if wave_k == 0:

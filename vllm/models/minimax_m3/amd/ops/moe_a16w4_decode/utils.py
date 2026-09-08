@@ -110,7 +110,7 @@ def inline_sort_max_pairs(n_tokens, topk, bm):
     return 64 if int(n_tokens) * int(topk) <= 64 else int(bm) * int(topk)
 
 
-def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
+def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64, bm=16):
     """Inline sort (n_tokens <= BM): no sort kernel; each block builds its own
     sorted_token_ids table from ``topk_ids`` with a wave ballot.
 
@@ -123,7 +123,9 @@ def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
     (expert id, owner, row count, build_table); non-owner blocks (duplicate experts)
     must exit. Pairs are scanned 64 per wave pass; ``max_pairs`` (BM*TOPK, 80 at
     BM=16 / topk 5) sets the number of passes. One 80-320 B load + ballots + LDS
-    stores per block instead of a separate sort kernel.
+    stores per block instead of a separate sort kernel. ``bm`` (16 or 32) is the
+    block's row count; non-matching pairs are parked in slot ``bm``, so ``tab``
+    needs ``bm + 1`` entries.
     """
     n_chunks = (int(max_pairs) + 63) // 64
     n_pairs = i32_ntok * fx.Int32(TOPK)
@@ -159,7 +161,7 @@ def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
         fuseds.append(
             (qs[c] // fx.Int32(TOPK)) | ((qs[c] % fx.Int32(TOPK)) << fx.Int32(24))
         )
-        slots.append(is_match.select(rank, fx.Int32(31)))  # non-matching -> slot 31
+        slots.append(is_match.select(rank, fx.Int32(bm)))  # non-matching -> slot bm
         r_p = fx.Int32(rocdl.readlane(T.i32, _raw(rank), _raw(p_lane)))
         rank_p = (p_chunk == fx.Int32(c)).select(r_p, rank_p)
         # matches so far = rank at lane 63 + lane 63's own match bit
@@ -168,7 +170,7 @@ def inline_sort_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab, max_pairs=64):
     owner = rank_p == fx.Int32(0)
 
     def build_table():
-        # padding sentinel in every slot first (slots 0..31), then the rows
+        # padding sentinel in every row slot first (0..31 covers bm <= 32), then the rows
         tab[lane % 32] = i32_ntok
         gpu.barrier()
         for c in range_constexpr(n_chunks):

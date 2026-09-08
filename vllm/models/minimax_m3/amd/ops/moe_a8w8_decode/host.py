@@ -46,8 +46,10 @@ def a16w8_gemm1(
     inline_sort=False,
     topk_ids=None,
     zero_out=None,
+    BM=BM,
 ):
-    """Stage 1: gate/up GEMM + swiglu-OAI -> bf16 ``[sorted rows, D_INTER]``."""
+    """Stage 1: gate/up GEMM + swiglu-OAI -> bf16 ``[sorted rows, D_INTER]``;
+    ``BM`` is the sort's row block (16 or 32)."""
     launch = get_gemm1(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
@@ -55,6 +57,7 @@ def a16w8_gemm1(
         TOPK=topk,
         n_tokens=int(n_tokens),
         inline_sort=inline_sort,
+        BM=BM,
     )
     if inline_sort:
         assert int(n_tokens) <= BM and topk_ids is not None and zero_out is not None
@@ -109,9 +112,10 @@ def a16w8_gemm2(
     topk=None,
     topk_ids=None,
     topk_weights=None,
+    BM=BM,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16``
-    ``[n_tokens, D_HIDDEN]`` (zeroed beforehand)."""
+    ``[n_tokens, D_HIDDEN]`` (zeroed beforehand); ``BM`` as for gemm1."""
     launch = get_gemm2(
         NE=NE,
         N_OUT=D_HIDDEN,
@@ -119,6 +123,7 @@ def a16w8_gemm2(
         n_tokens=int(n_tokens),
         inline_sort=inline_sort,
         TOPK=topk if inline_sort else None,
+        BM=BM,
     )
     if inline_sort:
         assert int(n_tokens) <= BM and topk_ids is not None and topk_weights is not None

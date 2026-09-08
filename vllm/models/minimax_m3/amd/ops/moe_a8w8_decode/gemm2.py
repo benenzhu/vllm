@@ -47,7 +47,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
 
 from .utils import _fp8x8_to_bf16
 
-BM = 16
+BM = 16  # default rows per m-block; compile_gemm2(BM=32) runs two 16-row tiles
 # Tiles: 128 output columns x 256 K per workgroup (MI355X 09-09 sweep: twice the
 # workgroups of the a16w4 256-column tile, 0.5-1 us faster at every M by better
 # balance across CUs). Split-K 3 up to KSPLIT_SMALL_M_TOKENS is worth ~1.5 us of
@@ -68,12 +68,16 @@ def compile_gemm2(
     n_tokens,
     inline_sort=False,
     TOPK=None,
+    BM=BM,
 ):
     """N_OUT = hidden size (output columns), D_INTER = contraction. Kernel for
     batches of up to ``n_tokens`` tokens: that picks split-K (``launch.ksplit``
     CTAs per tile, each over D_INTER/ksplit) and the inline-sort scan length
     (``launch.kernel_name``); ``inline_sort`` needs ``TOPK``. ``launch.tile_n`` is
-    the N tile for the grid."""
+    the N tile for the grid. ``BM`` (16 or 32) is the sort's row block; at 32 each
+    unpacked W fragment feeds two 16-row MFMA tiles."""
+    assert BM in (16, 32), BM
+    RT = BM // 16
     ksplit = KSPLIT_SMALL_M if n_tokens <= KSPLIT_SMALL_M_TOKENS else 1
     b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
@@ -91,8 +95,8 @@ def compile_gemm2(
     NLD = (BM * KH_TILE_BYTES) // (256 * 16)  # A copies per lane per tile
     A_BYTES = BM * KH_TILE_BYTES
     LDS_BYTES = max(A_BYTES, BM * TILE_N * 4)  # epilogue reuses the A region
-    tab_off = LDS_BYTES  # 32-entry routing table (inline sort only; 128 B)
-    LDS_BYTES += 128
+    tab_off = LDS_BYTES  # routing table (inline sort only): BM rows + sentinel slot
+    LDS_BYTES += 256
     if inline_sort:
         assert TOPK, "inline sort needs TOPK"
         assert n_tokens <= BM, "inline sort: every expert's rows fit one m-block"
@@ -112,6 +116,7 @@ def compile_gemm2(
     name = (
         f"m3_gemm2_a16w8_ne{NE}_h{N_OUT}_i{K}_tn{TILE_N}_tk{TILE_K}_ks{ksplit}_bcm{b_cache_mod}"
         + (f"_isort{max_pairs}" if inline_sort else "")
+        + (f"_bm{BM}" if BM != 16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
@@ -145,7 +150,7 @@ def compile_gemm2(
         if const_expr(inline_sort):
             tab = fx.recast_iter(fx.Int32, smem + tab_off)
             e, owner, _, build_tab = inline_sort_table(
-                arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs
+                arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs, bm=BM
             )
             if owner:
                 build_tab()
@@ -231,12 +236,13 @@ def compile_gemm2(
                         fx.slice(s_x_tiles4, (None, lds_byte // fx.Int32(16))),
                     )
 
-            def lds_load_a(k0, ku):
-                # block k0, K-step ku (8 bf16 per lane): row l16,
+            def lds_load_a(k0, ku, rt):
+                # block k0, K-step ku (8 bf16 per lane): row rt*16 + l16,
                 # bytes k0*128 + q16*32 + ku*16
+                row = l16 + fx.Int32(rt * 16)
                 col = q16 * fx.Int32(32) + fx.Int32(k0 * 128 + ku * 16)
-                byte = l16 * fx.Int32(KH_TILE_BYTES) + _a16w4_swizzle_xor16(
-                    l16, col, KB16
+                byte = row * fx.Int32(KH_TILE_BYTES) + _a16w4_swizzle_xor16(
+                    row, col, KB16
                 )
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
                 fx.copy_atom_call(
@@ -313,10 +319,14 @@ def compile_gemm2(
 
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
             acc_layout = fx.make_layout(4, 1)
-            acc = [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(NI)]
+            acc = [
+                [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(NI)]
+                for _ in range(RT)
+            ]
             zero4 = Vec.filled(4, 0.0, fx.Float32)
-            for ni in range_constexpr(NI):
-                acc[ni].store(zero4)
+            for rt in range_constexpr(RT):
+                for ni in range_constexpr(NI):
+                    acc[rt][ni].store(zero4)
 
             def _frag(v8):
                 t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
@@ -336,20 +346,23 @@ def compile_gemm2(
                         )
                         raw4 = fx.Vector(bb[ni][k0])
                         for ku in range_constexpr(2):
-                            fx.gemm(
-                                mma_atom,
-                                acc[ni],
-                                _frag(lds_load_a(k0, ku)),
-                                _frag(_fp8x8_to_bf16(raw4[2 * ku], raw4[2 * ku + 1], s)),
-                                acc[ni],
-                            )
+                            # one unpacked W fragment feeds every row tile
+                            b_t = _frag(_fp8x8_to_bf16(raw4[2 * ku], raw4[2 * ku + 1], s))
+                            for rt in range_constexpr(RT):
+                                fx.gemm(
+                                    mma_atom,
+                                    acc[rt][ni],
+                                    _frag(lds_load_a(k0, ku, rt)),
+                                    b_t,
+                                    acc[rt][ni],
+                                )
                 gpu.barrier()
 
             # epilogue: the A region is free once every wave passed the last barrier
             gpu.barrier()
             _atomic_bf16_epilog(
                 fx.Int32(fx.ptrtoint(smem)),
-                [acc[ni].load().ir_value() for ni in range(NI)],
+                [[acc[rt][ni].load().ir_value() for ni in range(NI)] for rt in range(RT)],
                 arg_out,
                 nb,
                 wave,
@@ -359,6 +372,7 @@ def compile_gemm2(
                 TILE_N,
                 packed,
                 weight,
+                bm=BM,
             )
 
     @flyc.jit

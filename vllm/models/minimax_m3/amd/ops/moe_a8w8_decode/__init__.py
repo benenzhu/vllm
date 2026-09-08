@@ -21,12 +21,50 @@ import torch
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
     MAX_DECODE_TOKENS,
-    MAX_INLINE_SORT_TOKENS,
-    TILE_M,
-    _intermediate_workspace,
     supports_batch,
     supports_shapes,
 )
+
+# Sort row block: 16 (one MFMA tile per block) below BM32_MIN_TOKENS, 32 from
+# there (two tiles per unpacked W fragment: an expert with more than 16 rows,
+# always the shared one, streams its weights half as often; inline sort reaches
+# 32 tokens). MI355X chain sweep of 09-09: 32 loses at every M <= 256 (most
+# experts have < 16 rows, so the second tile is padding work and the larger A
+# staging halves the workgroups per CU), so it is off; kept for the lab.
+BM32_MIN_TOKENS = MAX_DECODE_TOKENS + 1
+_workspaces: dict = {}
+
+
+def block_m_for(n_tokens: int) -> int:
+    return 32 if n_tokens >= BM32_MIN_TOKENS else 16
+
+
+def _intermediate_workspace(
+    device: torch.device, topk: int, intermediate_size: int, num_experts: int
+) -> torch.Tensor:
+    """gemm1 output, bf16 ``[rows, I]``: by pair (``pair * BM + row``) on the
+    sort-free path, by sorted row on the sorted one; sized for the largest of
+    the layouts of either block size at ``MAX_DECODE_TOKENS`` and allocated once
+    per (device, topk, I, E) so HIP-graph capture records no allocation."""
+    from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
+        max_sorted_rows,
+    )
+
+    key = (
+        device.index if device.index is not None else -1,
+        topk,
+        intermediate_size,
+        num_experts,
+    )
+    ws = _workspaces.get(key)
+    if ws is None:
+        rows = max(
+            [32 * topk * 32]
+            + [max_sorted_rows(MAX_DECODE_TOKENS, num_experts, topk, bm) for bm in (16, 32)]
+        )
+        ws = torch.empty((rows, intermediate_size), dtype=torch.bfloat16, device=device)
+        _workspaces[key] = ws
+    return ws
 
 logger = init_logger(__name__)
 
@@ -70,12 +108,13 @@ def a16w8_decode_moe(
 
     inter = _intermediate_workspace(x.device, topk, intermediate_size, num_experts)
     out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device)
-    inline = n_tokens <= MAX_INLINE_SORT_TOKENS
+    bm = block_m_for(n_tokens)
+    inline = n_tokens <= bm
     if inline:
         sorted_ids = sorted_w = sorted_eids = num_valid = None
     else:
         sorted_ids, sorted_w, sorted_eids, num_valid = moe_sort_decode(
-            topk_ids, topk_weights, num_experts, hidden_size, TILE_M, out
+            topk_ids, topk_weights, num_experts, hidden_size, bm, out
         )
     a16w8_gemm1(
         x_bf16=x,
@@ -95,6 +134,7 @@ def a16w8_decode_moe(
         sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid,
         sorted_token_ids=sorted_ids,
+        BM=bm,
     )
     a16w8_gemm2(
         inter_sorted_bf16=inter,
@@ -113,6 +153,7 @@ def a16w8_decode_moe(
         num_valid_ids=num_valid,
         sorted_token_ids=sorted_ids,
         sorted_weights=sorted_w,
+        BM=bm,
     )
     return out
 
@@ -233,8 +274,10 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
 
 
 __all__ = [
+    "BM32_MIN_TOKENS",
     "MAX_DECODE_TOKENS",
     "a16w8_decode_moe",
+    "block_m_for",
     "install_decode_fast_path",
     "is_mxfp8_aiter_layer",
     "supports_batch",

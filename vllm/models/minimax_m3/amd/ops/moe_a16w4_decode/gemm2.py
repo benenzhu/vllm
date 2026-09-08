@@ -61,9 +61,11 @@ def _atomic_bf16_epilog(
     BN,
     packed,
     weight,
+    bm=BM,
 ):
-    """accm[ni] (f32[4] per lane, MFMA C layout) -> LDS [BM, BN] f32 -> per row: 2
-    columns per lane x weight -> packed bf16 atomic add at out[token, col]."""
+    """accm[rt][ni] (f32[4] per lane, MFMA C layout, rt = 16-row tile of the
+    ``bm``-row block) -> LDS [bm, BN] f32 -> per row: 2 columns per lane x weight
+    -> packed bf16 atomic add at out[token, col]."""
     _n_per_wave = BN // 4
     num_acc_n = _n_per_wave // 16
     _s_count = BN // 64  # readback: each s-iter covers 64 cols (32 lanes x vec2)
@@ -77,16 +79,17 @@ def _atomic_bf16_epilog(
     out_base = _global_base_ptr1(arg_out)
 
     row_base = lane_div_16 * fx.Int32(4)
-    for J in range_constexpr(num_acc_n):
-        col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
-        vec = Vec(accm[J])
-        for v in range_constexpr(4):
-            idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
-            llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+    for rt in range_constexpr(len(accm)):
+        for J in range_constexpr(num_acc_n):
+            col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[rt][J])
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(rt * 16 + v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
 
     gpu.barrier()
 
-    for mr in range_constexpr(BM // 8):
+    for mr in range_constexpr(bm // 8):
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if token_id < i32_M:
@@ -413,7 +416,7 @@ def compile_gemm2(
             gpu.barrier()
             _atomic_bf16_epilog(
                 fx.Int32(fx.ptrtoint(smem)),
-                [acc[ni].load().ir_value() for ni in range(NI)],
+                [[acc[ni].load().ir_value() for ni in range(NI)]],
                 arg_out,
                 nb,
                 wave,
