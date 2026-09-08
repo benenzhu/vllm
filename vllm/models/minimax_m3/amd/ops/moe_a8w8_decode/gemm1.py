@@ -38,7 +38,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
     inline_sort_table,
 )
 
-from .utils import _fp8x8_to_bf16
+from .utils import _fp8x8_to_bf16, _pin_sgpr
 
 BM = 16  # rows per m-block (one MFMA M tile)
 NW = 4  # waves per workgroup
@@ -146,6 +146,13 @@ def compile_gemm1(
         arg_zero: fx.Int64,
         i32_zero_dw: fx.Int32,
     ):
+        if const_expr(inline_sort):
+            # one round of workgroups: every kernel argument up front (one round
+            # trip instead of three, see _pin_sgpr)
+            arg_x, arg_bq, arg_bscale, arg_mind, arg_out, arg_zero = (
+                _pin_sgpr(a) for a in (arg_x, arg_bq, arg_bscale, arg_mind, arg_out, arg_zero)
+            )
+            i32_ntok, i32_zero_dw = _pin_sgpr(i32_ntok, 32), _pin_sgpr(i32_zero_dw, 32)
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx, pid = fx.thread_idx.x, fx.block_idx.x
         lane = tx % 64
@@ -196,26 +203,32 @@ def compile_gemm1(
 
         else:
             mind = _global_i32_ptr(arg_mind)
-            cumsum0 = fx.Int32(_global_i32_ptr(arg_cumsum)[0])
-            go = mbase < cumsum0
 
             def mind_at(row):
                 return fx.Int32(mind[mbase + row])
 
+            # the expert id and the routing rows (in bounds for every block of the
+            # grid) are loaded together with the row count, not after its branch:
+            # one round trip less before the first W load (0.5-0.8 us at M >= 32)
+            cumsum0 = fx.Int32(_global_i32_ptr(arg_cumsum)[0])
+            e_sorted = fx.Int32(
+                fx.rocdl.readfirstlane(T.i32, fx.Int32(_global_i32_ptr(arg_eids)[mb]))
+            )
+            ld_row_s = wave * 4 + q16
+            ld_tok_s = mind_at(ld_row_s) & 0xFFFFFF
+            ep_tok_s = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+            go = mbase < cumsum0
+
         if go:
             if const_expr(inline_sort):
                 e = e_pair
+                # A staging: wave w loads row w*4 + lane//16, 16 B chunk j*16 + lane%16
+                ld_row = wave * 4 + q16
+                ld_tok = mind_at(ld_row) & 0xFFFFFF
+                # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
+                ep_tok = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
             else:
-                e = fx.Int32(
-                    fx.rocdl.readfirstlane(
-                        T.i32, fx.Int32(_global_i32_ptr(arg_eids)[mb])
-                    )
-                )
-            # A staging: wave w loads row w*4 + lane//16, 16 B chunk j*16 + lane%16
-            ld_row = wave * 4 + q16
-            ld_tok = mind_at(ld_row) & 0xFFFFFF
-            # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
-            ep_tok = [mind_at(q16 * 4 + ii) & 0xFFFFFF for ii in range_constexpr(4)]
+                e, ld_row, ld_tok, ep_tok = e_sorted, ld_row_s, ld_tok_s, ep_tok_s
             xr = buffer_ops.create_buffer_resource_from_addr(
                 arg_x, num_records_bytes=fx.Int64(i32_ntok) * (K * 2)
             )

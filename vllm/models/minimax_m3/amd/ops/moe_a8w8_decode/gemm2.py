@@ -45,7 +45,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
     inline_sort_table,
 )
 
-from .utils import _fp8x8_to_bf16
+from .utils import _fp8x8_to_bf16, _pin_sgpr
 
 BM = 16
 # Tiles: 128 output columns x 256 K per workgroup (MI355X 09-09 sweep: twice the
@@ -58,6 +58,9 @@ TILE_K = 256
 BLOCK_K = 64  # K per 1 KB W block (16 columns)
 KSPLIT_SMALL_M = 3
 KSPLIT_SMALL_M_TOKENS = 64
+# Kernel arguments loaded up front (_pin_sgpr) for the smallest batches only:
+# -0.1..-0.2 us at M <= 4, +0.6 us at M = 16.
+PIN_ARGS_TOKENS = 8
 
 
 def compile_gemm2(
@@ -75,6 +78,7 @@ def compile_gemm2(
     (``launch.kernel_name``); ``inline_sort`` needs ``TOPK``. ``launch.tile_n`` is
     the N tile for the grid."""
     ksplit = KSPLIT_SMALL_M if n_tokens <= KSPLIT_SMALL_M_TOKENS else 1
+    pin_args = inline_sort and n_tokens <= PIN_ARGS_TOKENS
     b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
     assert K % TILE_K == 0 and N_OUT % TILE_N == 0
@@ -112,6 +116,7 @@ def compile_gemm2(
     name = (
         f"m3_gemm2_a16w8_ne{NE}_h{N_OUT}_i{K}_tn{TILE_N}_tk{TILE_K}_ks{ksplit}_bcm{b_cache_mod}"
         + (f"_isort{max_pairs}" if inline_sort else "")
+        + ("_pin" if pin_args else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
@@ -126,6 +131,13 @@ def compile_gemm2(
         i32_M: fx.Int32,
         arg_out: fx.Int64,
     ):
+        if const_expr(pin_args):
+            # every kernel argument up front (_pin_sgpr)
+            arg_a, arg_bq, arg_bscale, arg_stids, arg_sweights, arg_out = (
+                _pin_sgpr(a)
+                for a in (arg_a, arg_bq, arg_bscale, arg_stids, arg_sweights, arg_out)
+            )
+            i32_M = _pin_sgpr(i32_M, 32)
         smem = fx.SharedAllocator().allocate(Shared).peek().raw.ptr
         tx = fx.Int32(gpu.thread_id("x"))
         pid = fx.Int32(gpu.block_id("x"))

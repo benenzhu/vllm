@@ -3,6 +3,7 @@
 """MXFP8 weight unpack shared by the a16w8 decode gemm1 / gemm2 kernels."""
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
@@ -27,3 +28,17 @@ def _fp8x8_to_bf16(dw_lo, dw_hi, scale_f32):
     return fx.Vector.from_elements(
         [fx.Vector(h).bitcast(fx.Int32)[0] for h in halves], fx.Int32
     ).bitcast(fx.BFloat16)
+
+
+def _pin_sgpr(v, bits=64):
+    """Kernel argument ``v`` (i64 pointer or i32) routed through a no-op asm with
+    a tied SGPR operand: its kernarg ``s_load`` is issued and waited for right
+    here instead of being sunk to the first use inside a branch. Pinning every
+    argument at the top of a kernel makes one round trip of all of them; the
+    inline-sort kernels (a single round of workgroups, the prologue on the
+    critical path) gain 0.1-0.3 us from it, the sorted ones lose 1-2 us."""
+    ty = T.i64 if bits == 64 else T.i32
+    r = _llvm.inline_asm(
+        ty, [fx.as_ir_value(v)], "; pin $0", "=s,0", has_side_effects=True
+    )
+    return fx.Int64(r) if bits == 64 else fx.Int32(r)
