@@ -38,7 +38,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.utils import (
     inline_sort_table,
 )
 
-from .utils import _fp8x8_to_bf16, _pin_sgpr
+from .utils import _fp8x8_to_bf16
 
 BM = 16  # rows per m-block (one MFMA M tile)
 NW = 4  # waves per workgroup
@@ -146,13 +146,6 @@ def compile_gemm1(
         arg_zero: fx.Int64,
         i32_zero_dw: fx.Int32,
     ):
-        if const_expr(inline_sort):
-            # one round of workgroups: every kernel argument up front (one round
-            # trip instead of three, see _pin_sgpr)
-            arg_x, arg_bq, arg_bscale, arg_mind, arg_out, arg_zero = (
-                _pin_sgpr(a) for a in (arg_x, arg_bq, arg_bscale, arg_mind, arg_out, arg_zero)
-            )
-            i32_ntok, i32_zero_dw = _pin_sgpr(i32_ntok, 32), _pin_sgpr(i32_zero_dw, 32)
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx, pid = fx.thread_idx.x, fx.block_idx.x
         lane = tx % 64
