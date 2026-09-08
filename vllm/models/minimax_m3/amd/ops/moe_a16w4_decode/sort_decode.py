@@ -24,7 +24,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 
 from .utils import _lds_atomic_add_i32
 
@@ -36,17 +36,46 @@ def max_sorted_rows(n_tokens: int, E: int, topk: int, block_m: int) -> int:
     return ((cumsum_max + block_m - 1) // block_m) * block_m
 
 
+def wide_layout_rows(n_tokens: int, E: int, topk: int, block_m: int, wide_bm: int):
+    """Row bounds of the wide-first layout: (rows of the shared expert = its
+    ceil(n_tokens/wide_bm) wide blocks, max rows of the routed experts in
+    block_m blocks). The shared expert owns one of the ``topk`` slots of every
+    token."""
+    shared = ((n_tokens + wide_bm - 1) // wide_bm) * wide_bm
+    routed_pairs = n_tokens * (topk - 1)
+    active = min(E - 1, routed_pairs)
+    routed = ((routed_pairs + active * (block_m - 1) + block_m - 1) // block_m) * block_m
+    return shared, routed
+
+
 threads = 256  # sorter block (one thread per expert, power of two for the scan)
 zero_ctas = 127  # blocks that zero the output
 
 
 @functools.cache
-def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: int):
+def compile_decode_sort(
+    *, E: int, topk: int, block_m: int, H: int, max_tokens: int, wide_first=None
+):
+    """``wide_first = (expert, wide_bm)`` puts that expert's rows first, padded
+    to ``wide_bm``-row blocks (the shared expert, which every token routes to,
+    so the gemms can run it in wide blocks); the other experts follow in
+    ``block_m`` blocks. Block ids: the wide blocks are 0 .. S-1, S =
+    padded_rows / wide_bm, then one per block_m block."""
     assert (block_m & (block_m - 1)) == 0 and threads >= E and (H * 2) % 16 == 0
     bm_shift = block_m.bit_length() - 1
     PPT = (max_tokens * topk + threads - 1) // threads  # pairs per thread
     scan_rounds = threads.bit_length() - 1
     tag = f"E{E}_K{topk}_BM{block_m}_H{H}_M{max_tokens}_Z{zero_ctas}_T{threads}"
+    if wide_first is not None:
+        shared_e, wide_bm = wide_first
+        assert (wide_bm & (wide_bm - 1)) == 0 and 0 <= shared_e < E
+        wide_shift = wide_bm.bit_length() - 1
+        tag += f"_wide{wide_bm}s{shared_e}"
+
+    def slot_of(e):  # scan slot of expert e: the wide expert first, then id order
+        if wide_first is None:
+            return e
+        return (e + fx.Int32(E - shared_e)) % fx.Int32(E)
 
     @fx.struct
     class Shared:
@@ -87,10 +116,10 @@ def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: 
                 count[tx] = 0
             fx.gpu.barrier()
 
-            # 2. histogram
+            # 2. histogram (by scan slot)
             for p, valid, e, _w in pairs:
                 if valid:
-                    _lds_atomic_add_i32(count + e, 1)
+                    _lds_atomic_add_i32(count + slot_of(e), 1)
             fx.gpu.barrier()
 
             # 3. inclusive Hillis-Steele scan of the padded counts (0 beyond E)
@@ -98,6 +127,8 @@ def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: 
                 fx.Int32(count[t_lt_E.select(tx, fx.Int32(0))]), fx.Int32(0)
             )
             padded = (cnt + (block_m - 1)) & ~(block_m - 1)
+            if const_expr(wide_first is not None):
+                padded = (tx == 0).select((cnt + (wide_bm - 1)) & ~(wide_bm - 1), padded)
             scan[0][tx] = padded
             fx.gpu.barrier()
             src, dst = 0, 1
@@ -112,13 +143,24 @@ def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: 
             end = fx.Int32(scan[src][tx])
             start = end - padded
 
-            # 4. thread e: cursor, expert ids of its blocks, padding rows, total
+            # 4. thread t (slot t): cursor, expert ids of its blocks, padding rows,
+            # total
+            if const_expr(wide_first is None):
+                e_t = tx
+                b_lo, b_hi = start >> bm_shift, end >> bm_shift
+            else:
+                e_t = (tx + shared_e) % E
+                p0 = fx.Int32(scan[src][0])  # rows of the wide expert (S blocks)
+                n_wide = p0 >> wide_shift
+                is0 = tx == 0
+                b_lo = is0.select(fx.Int32(0), n_wide + ((start - p0) >> bm_shift))
+                b_hi = is0.select(n_wide, n_wide + ((end - p0) >> bm_shift))
             if t_lt_E:
                 cursor[tx] = start
                 if tx == E - 1:
                     num_valid[0] = end
-                for b in range(start >> bm_shift, end >> bm_shift):
-                    sorted_eids[fx.Int32(b)] = tx
+                for b in range(b_lo, b_hi):
+                    sorted_eids[fx.Int32(b)] = e_t
                 for r in range(start + cnt, end):
                     sorted_ids[fx.Int32(r)] = n_tok  # padding: token n_tokens, slot 0
                     sorted_w[fx.Int32(r)] = fx.Float32(0.0)
@@ -127,7 +169,7 @@ def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: 
             # 5. place the pairs
             for p, valid, e, w in pairs:
                 if valid:
-                    row = _lds_atomic_add_i32(cursor + e, 1)
+                    row = _lds_atomic_add_i32(cursor + slot_of(e), 1)
                     sorted_ids[row] = ((p // topk) & 0x00FFFFFF) | ((p % topk) << 24)
                     sorted_w[row] = w
         else:
@@ -168,20 +210,34 @@ def compile_decode_sort(*, E: int, topk: int, block_m: int, H: int, max_tokens: 
     return launch
 
 
-def moe_sort_decode(topk_ids, topk_weights, E, H, block_m, out):
+def moe_sort_decode(topk_ids, topk_weights, E, H, block_m, out, wide_first=None):
     """Drop-in for ``moe_sorting(topk_ids, topk_w, E, H, dtype, block_size)`` ->
     (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids); ``out``
-    (``[n_tokens, H]`` bf16, contiguous) is zeroed in place."""
+    (``[n_tokens, H]`` bf16, contiguous) is zeroed in place. ``wide_first =
+    (expert, wide_bm)``: that expert's rows first in wide_bm-row blocks (see
+    ``compile_decode_sort``); ``sorted_expert_ids`` then has one entry per wide
+    block followed by one per block_m block."""
     n_tokens, topk = topk_ids.shape
     dev = topk_ids.device
-    ms = max_sorted_rows(n_tokens, E, topk, block_m)
+    if wide_first is None:
+        ms = max_sorted_rows(n_tokens, E, topk, block_m)
+        n_blocks = ms // block_m
+    else:
+        shared_rows, routed_rows = wide_layout_rows(n_tokens, E, topk, block_m, wide_first[1])
+        ms = shared_rows + routed_rows
+        n_blocks = shared_rows // wide_first[1] + routed_rows // block_m
     sorted_ids = torch.empty(ms, dtype=torch.int32, device=dev)
     sorted_w = torch.empty(ms, dtype=torch.float32, device=dev)
-    sorted_eids = torch.empty(ms // block_m, dtype=torch.int32, device=dev)
+    sorted_eids = torch.empty(n_blocks, dtype=torch.int32, device=dev)
     num_valid = torch.empty(2, dtype=torch.int32, device=dev)
     assert n_tokens <= 256
     launch = compile_decode_sort(
-        E=E, topk=topk, block_m=block_m, H=H, max_tokens=64 if n_tokens <= 64 else 256
+        E=E,
+        topk=topk,
+        block_m=block_m,
+        H=H,
+        max_tokens=64 if n_tokens <= 64 else 256,
+        wide_first=wide_first,
     )
     launch(
         topk_ids.contiguous().int().view(-1),

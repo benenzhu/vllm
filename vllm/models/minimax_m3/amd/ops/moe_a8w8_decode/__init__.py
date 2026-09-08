@@ -32,11 +32,21 @@ from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
 # experts have < 16 rows, so the second tile is padding work and the larger A
 # staging halves the workgroups per CU), so it is off; kept for the lab.
 BM32_MIN_TOKENS = MAX_DECODE_TOKENS + 1
+# Wide-first layout (sorted mode): the shared expert, which every token routes
+# to, is sorted first in gemm1.WIDE_BM-row blocks and run with the wide bodies
+# of gemm1 / gemm2, so its weights stream once per WIDE_BM rows instead of once
+# per 16. Chain sweep (MI355X, 09-09): -2 us at 48, -4 at 64, -7 at 96, -10 at
+# 128, -18 at 256; nothing at 32.
+WIDE_MIN_TOKENS = 40
 _workspaces: dict = {}
 
 
 def block_m_for(n_tokens: int) -> int:
     return 32 if n_tokens >= BM32_MIN_TOKENS else 16
+
+
+def wide_for(n_tokens: int) -> bool:
+    return n_tokens >= WIDE_MIN_TOKENS and n_tokens > block_m_for(n_tokens)
 
 
 def _intermediate_workspace(
@@ -48,7 +58,9 @@ def _intermediate_workspace(
     per (device, topk, I, E) so HIP-graph capture records no allocation."""
     from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode.sort_decode import (
         max_sorted_rows,
+        wide_layout_rows,
     )
+    from vllm.models.minimax_m3.amd.ops.moe_a8w8_decode.gemm1 import WIDE_BM
 
     key = (
         device.index if device.index is not None else -1,
@@ -61,6 +73,7 @@ def _intermediate_workspace(
         rows = max(
             [32 * topk * 32]
             + [max_sorted_rows(MAX_DECODE_TOKENS, num_experts, topk, bm) for bm in (16, 32)]
+            + [sum(wide_layout_rows(MAX_DECODE_TOKENS, num_experts, topk, bm, WIDE_BM)) for bm in (16, 32)]
         )
         ws = torch.empty((rows, intermediate_size), dtype=torch.bfloat16, device=device)
         _workspaces[key] = ws
@@ -110,11 +123,20 @@ def a16w8_decode_moe(
     out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=x.device)
     bm = block_m_for(n_tokens)
     inline = n_tokens <= bm
+    wide = wide_for(n_tokens)
     if inline:
         sorted_ids = sorted_w = sorted_eids = num_valid = None
     else:
+        from vllm.models.minimax_m3.amd.ops.moe_a8w8_decode.gemm1 import WIDE_BM
+
         sorted_ids, sorted_w, sorted_eids, num_valid = moe_sort_decode(
-            topk_ids, topk_weights, num_experts, hidden_size, bm, out
+            topk_ids,
+            topk_weights,
+            num_experts,
+            hidden_size,
+            bm,
+            out,
+            wide_first=(num_experts - 1, WIDE_BM) if wide else None,
         )
     a16w8_gemm1(
         x_bf16=x,
@@ -135,6 +157,7 @@ def a16w8_decode_moe(
         num_valid_ids=num_valid,
         sorted_token_ids=sorted_ids,
         BM=bm,
+        wide=wide,
     )
     a16w8_gemm2(
         inter_sorted_bf16=inter,
@@ -154,6 +177,7 @@ def a16w8_decode_moe(
         sorted_token_ids=sorted_ids,
         sorted_weights=sorted_w,
         BM=bm,
+        wide=wide,
     )
     return out
 
@@ -276,6 +300,7 @@ def install_decode_fast_path(experts, prefix: str = "") -> bool:
 __all__ = [
     "BM32_MIN_TOKENS",
     "MAX_DECODE_TOKENS",
+    "WIDE_MIN_TOKENS",
     "a16w8_decode_moe",
     "block_m_for",
     "install_decode_fast_path",

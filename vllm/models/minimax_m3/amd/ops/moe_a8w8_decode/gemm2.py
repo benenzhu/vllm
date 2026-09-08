@@ -17,6 +17,12 @@ loads, W streamed per wave, LDS-staged atomic epilogue) with fp8 weights:
   half ``k0//2``, so per 256-K tile it loads two scale dwords (groups
   ``klane//2`` and ``2 + klane//2``, bytes: 128-K half, N-half).
 
+* a block of ``BM`` sorted rows is ``RT = BM/16`` MFMA row tiles that share every
+  unpacked W fragment. With ``wide=True`` (sorted layout of ``sort_decode``'s
+  ``wide_first``) the shared expert's rows come first in WIDE_SORT_BM-row
+  blocks, which this kernel runs as WIDE_BM-row blocks with the wide body; the
+  routed experts follow in ``BM``-row blocks.
+
 Layouts (aiter ``shuffle_weight(is_guinterleave=True, gate_up=False)`` +
 ``shuffle_scale``, what vLLM's ``shuffle_mxfp8_moe_weights`` stores for w2):
   W2     [E, H/16, K/64, klane 4, nlane 16, 16 B]  fp8 e4m3
@@ -58,6 +64,26 @@ TILE_K = 256
 BLOCK_K = 64  # K per 1 KB W block (16 columns)
 KSPLIT_SMALL_M = 3
 KSPLIT_SMALL_M_TOKENS = 64
+# Wide blocks of the shared expert: the sort pads it to WIDE_SORT_BM-row blocks
+# (gemm1's wide block); this kernel runs them as WIDE_BM-row blocks so its W2
+# streams M/WIDE_BM times instead of M/16 (a 32-row A tile keeps the LDS and
+# accumulator footprint within the 16-row tile's occupancy).
+WIDE_SORT_BM = 128
+WIDE_BM = 32
+
+
+class _Tile:
+    """Compile-time constants of one block body (row tiles x the fixed N/K tile)."""
+
+    def __init__(self, RT):
+        self.RT = RT
+        self.BM = RT * 16
+        self.KH_TILE_BYTES = TILE_K * 2  # A bytes per row per tile
+        self.KB16 = self.KH_TILE_BYTES // 16
+        self.TILE_K_DW = self.KH_TILE_BYTES // 4
+        self.NLD = (self.BM * self.KH_TILE_BYTES) // (256 * 16)  # A copies per lane per tile
+        self.A_BYTES = self.BM * self.KH_TILE_BYTES
+        self.LDS_BYTES = max(self.A_BYTES, self.BM * TILE_N * 4)  # epilogue reuses A
 
 
 def compile_gemm2(
@@ -69,15 +95,17 @@ def compile_gemm2(
     inline_sort=False,
     TOPK=None,
     BM=BM,
+    wide=False,
 ):
     """N_OUT = hidden size (output columns), D_INTER = contraction. Kernel for
     batches of up to ``n_tokens`` tokens: that picks split-K (``launch.ksplit``
     CTAs per tile, each over D_INTER/ksplit) and the inline-sort scan length
     (``launch.kernel_name``); ``inline_sort`` needs ``TOPK``. ``launch.tile_n`` is
-    the N tile for the grid. ``BM`` (16 or 32) is the sort's row block; at 32 each
-    unpacked W fragment feeds two 16-row MFMA tiles."""
+    the N tile for the grid. ``BM`` (16 or 32) is the sort's row block of the
+    routed experts; ``wide`` (sorted mode) adds the body for the shared expert's
+    wide blocks, which come first: ``ceil(n_tokens/WIDE_SORT_BM) *
+    (WIDE_SORT_BM/WIDE_BM)`` wide blocks of ``launch.wide_bm`` rows."""
     assert BM in (16, 32), BM
-    RT = BM // 16
     ksplit = KSPLIT_SMALL_M if n_tokens <= KSPLIT_SMALL_M_TOKENS else 1
     b_cache_mod = 2  # non-temporal W loads
     K = D_INTER
@@ -87,14 +115,15 @@ def compile_gemm2(
     KT = KT_ALL // ksplit  # TILE_K tiles per CTA
     K0 = TILE_K // BLOCK_K  # 1 KB W blocks per tile
     KB_ALL = K // BLOCK_K  # W blocks per column group
-    KH_TILE_BYTES = TILE_K * 2  # A bytes per row per tile
-    KB16 = KH_TILE_BYTES // 16
     NPW = TILE_N // 4
     NI = NPW // 16
-    TILE_K_DW = KH_TILE_BYTES // 4
-    NLD = (BM * KH_TILE_BYTES) // (256 * 16)  # A copies per lane per tile
-    A_BYTES = BM * KH_TILE_BYTES
-    LDS_BYTES = max(A_BYTES, BM * TILE_N * 4)  # epilogue reuses the A region
+    narrow = _Tile(BM // 16)
+    bodies = [narrow]
+    if wide:
+        assert not inline_sort and WIDE_SORT_BM % WIDE_BM == 0
+        widet = _Tile(WIDE_BM // 16)
+        bodies.append(widet)
+    LDS_BYTES = max(t.LDS_BYTES for t in bodies)
     tab_off = LDS_BYTES  # routing table (inline sort only): BM rows + sentinel slot
     LDS_BYTES += 256
     if inline_sort:
@@ -117,6 +146,7 @@ def compile_gemm2(
         f"m3_gemm2_a16w8_ne{NE}_h{N_OUT}_i{K}_tn{TILE_N}_tk{TILE_K}_ks{ksplit}_bcm{b_cache_mod}"
         + (f"_isort{max_pairs}" if inline_sort else "")
         + (f"_bm{BM}" if BM != 16 else "")
+        + (f"_wide{WIDE_BM}of{WIDE_SORT_BM}" if wide else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
@@ -141,95 +171,75 @@ def compile_gemm2(
             tile, ks = pid // fx.Int32(ksplit), pid % fx.Int32(ksplit)
         else:
             tile, ks = pid, fx.Int32(0)
-        mb, nb = tile // fx.Int32(NNB), tile % fx.Int32(NNB)
-        mrow = mb * fx.Int32(BM)
         m_lane = tx // fx.Int32(32)
         sw_base = _global_base_ptr1(arg_sweights)
-        # routing of this block's rows, issued up front: expert id, token id (and
-        # weight) per row for the epilogue and the pad mask
-        if const_expr(inline_sort):
-            tab = fx.recast_iter(fx.Int32, smem + tab_off)
-            e, owner, _, build_tab = inline_sort_table(
-                arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs, bm=BM
-            )
-            if owner:
-                build_tab()
-            np_m1 = i32_M * fx.Int32(TOPK) - fx.Int32(1)
-            go = owner
+        xbuf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFC000))
+        x_tiles4 = fx.logical_divide(xbuf, fx.make_layout(4, 1))
+        x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
+        a_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+        wr = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_bq)), num_records_bytes=W_BYTES
+        )
+        sr = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_bscale)), num_records_bytes=SW_BYTES
+        )
+        c_k_dw = (K * 2) // 4
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        acc_layout = fx.make_layout(4, 1)
+        zero4 = Vec.filled(4, 0.0, fx.Float32)
 
-            def stid_at(row):  # token | slot<<24 for row of this block (LDS table)
-                return tab[row]
+        def _frag(v8):
+            t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+            t.store(v8)
+            return t
 
-            def sweight_at(row, fused):  # topk_weights[token*TOPK + slot], pads clamped
-                f = fx.Int32(fused)
-                pair = (f & fx.Int32(0x00FFFFFF)) * fx.Int32(TOPK) + (f >> fx.Int32(24))
-                pair = fx.Int32(arith.minsi(_raw(pair), _raw(np_m1)))
-                return llvm.load(
-                    T.f32, _gep1(sw_base, pair * fx.Int32(4)), invariant=True
-                )
+        def rows_of(c, stid_at, sweight_at):
+            """Routing of a block's rows (token id and weight per row for the
+            epilogue, the pad mask of the A copies), issued up front."""
+            packed, weight = [], []
+            for mr in range_constexpr(c.BM // 8):
+                packed.append(stid_at(fx.Int32(mr * 8) + m_lane))
+                weight.append(sweight_at(fx.Int32(mr * 8) + m_lane, packed[-1]))
+            # A copies: lane covers dwords tx*4 + i*1024 of the [BM, TILE_K] bf16 tile
+            row_local = [
+                (tx * fx.Int32(4) + fx.Int32(i * 1024)) // fx.Int32(c.TILE_K_DW)
+                for i in range_constexpr(c.NLD)
+            ]
+            col_dw = [
+                (tx * fx.Int32(4) + fx.Int32(i * 1024)) % fx.Int32(c.TILE_K_DW)
+                for i in range_constexpr(c.NLD)
+            ]
+            row_valid = [
+                (fx.Int32(stid_at(row_local[i])) & fx.Int32(0x00FFFFFF)) < i32_M
+                for i in range_constexpr(c.NLD)
+            ]
+            return packed, weight, row_local, col_dw, row_valid
 
-        else:
-            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
-            e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, mb)))
-            stids_base = _global_base_ptr1(arg_stids)
-            go = tile < (cumsum0 // fx.Int32(BM)) * fx.Int32(NNB)
-
-            def stid_at(row):
-                return llvm.load(
-                    T.i32, _gep1(stids_base, (mrow + row) * fx.Int32(4)), invariant=True
-                )
-
-            def sweight_at(row, fused):
-                return llvm.load(
-                    T.f32, _gep1(sw_base, (mrow + row) * fx.Int32(4)), invariant=True
-                )
-
-        packed, weight = [], []
-        for mr in range_constexpr(BM // 8):
-            packed.append(stid_at(fx.Int32(mr * 8) + m_lane))
-            weight.append(sweight_at(fx.Int32(mr * 8) + m_lane, packed[-1]))
-        # A copies: lane covers dwords tx*4 + i*1024 of the [BM, TILE_K] bf16 tile
-        row_local = [
-            (tx * fx.Int32(4) + fx.Int32(i * 1024)) // fx.Int32(TILE_K_DW)
-            for i in range_constexpr(NLD)
-        ]
-        col_dw = [
-            (tx * fx.Int32(4) + fx.Int32(i * 1024)) % fx.Int32(TILE_K_DW)
-            for i in range_constexpr(NLD)
-        ]
-        row_valid = [
-            (fx.Int32(stid_at(row_local[i])) & fx.Int32(0x00FFFFFF)) < i32_M
-            for i in range_constexpr(NLD)
-        ]
-
-        if go:
+        def body(c, mrow, nb, e, packed, weight, row_local, col_dw, row_valid):
+            """One (block, n-block, K range): A tiles by DMA into LDS, W tiles per
+            wave, MFMAs over the block's RT row tiles, atomic epilogue."""
             expert_off = e * fx.Int32(N_OUT)
             by_n = nb * fx.Int32(TILE_N)
-            xbuf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFC000))
-            x_tiles4 = fx.logical_divide(xbuf, fx.make_layout(4, 1))
-            x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
             s_x = fx.make_view(
-                fx.recast_iter(fx.Int32, smem), fx.make_layout(A_BYTES // 4, 1)
+                fx.recast_iter(fx.Int32, smem), fx.make_layout(c.A_BYTES // 4, 1)
             )
             s_x_tiles4 = fx.logical_divide(s_x, fx.make_layout(4, 1))
-            a_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-            c_k_dw = (K * 2) // 4
             row_base_dw = [
-                (mrow + row_local[i]) * fx.Int32(c_k_dw) for i in range_constexpr(NLD)
+                (mrow + row_local[i]) * fx.Int32(c_k_dw) for i in range_constexpr(c.NLD)
             ]
 
             def dma_a_tile(kt):
                 # 16 B per lane straight into LDS; the XOR swizzle is applied to the
                 # global column (the LDS destination of a direct load is linear)
-                base_dw = (ks * fx.Int32(KT) + fx.Int32(kt)) * fx.Int32(TILE_K_DW)
-                for i in range_constexpr(NLD):
+                base_dw = (ks * fx.Int32(KT) + fx.Int32(kt)) * fx.Int32(c.TILE_K_DW)
+                for i in range_constexpr(c.NLD):
                     col_bytes = col_dw[i] * fx.Int32(4)
-                    col_sw = _a16w4_swizzle_xor16(row_local[i], col_bytes, KB16)
+                    col_sw = _a16w4_swizzle_xor16(row_local[i], col_bytes, c.KB16)
                     row_k_dw = row_valid[i].select(
                         row_base_dw[i] + base_dw, fx.Int32(A_OOB_DW)
                     )
                     global_byte = row_k_dw * fx.Int32(4) + col_sw
-                    lds_byte = row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+                    lds_byte = row_local[i] * fx.Int32(c.KH_TILE_BYTES) + col_bytes
                     fx.copy(
                         x_dma_atom,
                         fx.slice(x_tiles4, (None, global_byte // fx.Int32(16))),
@@ -241,8 +251,8 @@ def compile_gemm2(
                 # bytes k0*128 + q16*32 + ku*16
                 row = l16 + fx.Int32(rt * 16)
                 col = q16 * fx.Int32(32) + fx.Int32(k0 * 128 + ku * 16)
-                byte = row * fx.Int32(KH_TILE_BYTES) + _a16w4_swizzle_xor16(
-                    row, col, KB16
+                byte = row * fx.Int32(c.KH_TILE_BYTES) + _a16w4_swizzle_xor16(
+                    row, col, c.KB16
                 )
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
                 fx.copy_atom_call(
@@ -250,12 +260,6 @@ def compile_gemm2(
                 )
                 return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)
 
-            wr = buffer_ops.create_buffer_resource_from_addr(
-                _raw(fx.Int64(arg_bq)), num_records_bytes=W_BYTES
-            )
-            sr = buffer_ops.create_buffer_resource_from_addr(
-                _raw(fx.Int64(arg_bscale)), num_records_bytes=SW_BYTES
-            )
             # W2 columns of this wave: block (expert_off + col)//16, this CTA's K range
             # starts at 64-K block ks*KT*K0; per tile the block index goes in an SGPR
             col = [
@@ -317,21 +321,13 @@ def compile_gemm2(
                 ]
                 return bb, sc
 
-            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
-            acc_layout = fx.make_layout(4, 1)
             acc = [
                 [fx.make_rmem_tensor(acc_layout, fx.Float32) for _ in range(NI)]
-                for _ in range(RT)
+                for _ in range(c.RT)
             ]
-            zero4 = Vec.filled(4, 0.0, fx.Float32)
-            for rt in range_constexpr(RT):
+            for rt in range_constexpr(c.RT):
                 for ni in range_constexpr(NI):
                     acc[rt][ni].store(zero4)
-
-            def _frag(v8):
-                t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-                t.store(v8)
-                return t
 
             for kt in range_constexpr(KT):
                 dma_a_tile(kt)
@@ -348,7 +344,7 @@ def compile_gemm2(
                         for ku in range_constexpr(2):
                             # one unpacked W fragment feeds every row tile
                             b_t = _frag(_fp8x8_to_bf16(raw4[2 * ku], raw4[2 * ku + 1], s))
-                            for rt in range_constexpr(RT):
+                            for rt in range_constexpr(c.RT):
                                 fx.gemm(
                                     mma_atom,
                                     acc[rt][ni],
@@ -362,7 +358,7 @@ def compile_gemm2(
             gpu.barrier()
             _atomic_bf16_epilog(
                 fx.Int32(fx.ptrtoint(smem)),
-                [[acc[rt][ni].load().ir_value() for ni in range(NI)] for rt in range(RT)],
+                [[acc[rt][ni].load().ir_value() for ni in range(NI)] for rt in range(c.RT)],
                 arg_out,
                 nb,
                 wave,
@@ -372,8 +368,85 @@ def compile_gemm2(
                 TILE_N,
                 packed,
                 weight,
-                bm=BM,
+                bm=c.BM,
             )
+
+        if const_expr(inline_sort):
+            # block = routing pair mb: expert + rows from a ballot over the pairs
+            mb, nb = tile // fx.Int32(NNB), tile % fx.Int32(NNB)
+            mrow = mb * fx.Int32(BM)
+            tab = fx.recast_iter(fx.Int32, smem + tab_off)
+            e, owner, _, build_tab = inline_sort_table(
+                arg_stids, i32_M, TOPK, mb, lane, tab, max_pairs=max_pairs, bm=BM
+            )
+            if owner:
+                build_tab()
+            np_m1 = i32_M * fx.Int32(TOPK) - fx.Int32(1)
+
+            def stid_at(row):  # token | slot<<24 for row of this block (LDS table)
+                return tab[row]
+
+            def sweight_at(row, fused):  # topk_weights[token*TOPK + slot], pads clamped
+                f = fx.Int32(fused)
+                pair = (f & fx.Int32(0x00FFFFFF)) * fx.Int32(TOPK) + (f >> fx.Int32(24))
+                pair = fx.Int32(arith.minsi(_raw(pair), _raw(np_m1)))
+                return llvm.load(
+                    T.f32, _gep1(sw_base, pair * fx.Int32(4)), invariant=True
+                )
+
+            if owner:
+                rows = rows_of(narrow, stid_at, sweight_at)
+                body(narrow, mrow, nb, e, *rows)
+        else:
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+            stids_base = _global_base_ptr1(arg_stids)
+
+            def sorted_block(c, mb_id, mrow, nb, go):
+                e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, mb_id)))
+
+                def stid_at(row):
+                    return llvm.load(
+                        T.i32, _gep1(stids_base, (mrow + row) * fx.Int32(4)), invariant=True
+                    )
+
+                def sweight_at(row, fused):
+                    return llvm.load(
+                        T.f32, _gep1(sw_base, (mrow + row) * fx.Int32(4)), invariant=True
+                    )
+
+                rows = rows_of(c, stid_at, sweight_at)
+                if go:
+                    body(c, mrow, nb, e, *rows)
+
+            if const_expr(wide):
+                # the shared expert's sort blocks come first, each WIDE_SORT_BM/WIDE_BM
+                # wide blocks of this kernel
+                SUB = WIDE_SORT_BM // WIDE_BM
+                n_sort_wide = (i32_M + fx.Int32(WIDE_SORT_BM - 1)) // fx.Int32(WIDE_SORT_BM)
+                n_wide = n_sort_wide * fx.Int32(SUB)
+                n_wide_tiles = n_wide * fx.Int32(NNB)
+                # (distinct names per branch: the AST rewriter yields variables that
+                # both branches of a dynamic if assign)
+                if tile < n_wide_tiles:
+                    mbw = tile // fx.Int32(NNB)
+                    sorted_block(
+                        widet,
+                        mbw // fx.Int32(SUB),
+                        mbw * fx.Int32(WIDE_BM),
+                        tile % fx.Int32(NNB),
+                        mbw < n_wide,
+                    )
+                if tile >= n_wide_tiles:
+                    qn = tile - n_wide_tiles
+                    mbn = qn // fx.Int32(NNB)
+                    mrown = n_sort_wide * fx.Int32(WIDE_SORT_BM) + mbn * fx.Int32(BM)
+                    sorted_block(
+                        narrow, n_sort_wide + mbn, mrown, qn % fx.Int32(NNB), mrown < cumsum0
+                    )
+            else:
+                mb, nb = tile // fx.Int32(NNB), tile % fx.Int32(NNB)
+                mrow = mb * fx.Int32(BM)
+                sorted_block(narrow, mb, mrow, nb, mrow < cumsum0)
 
     @flyc.jit
     def launch(
@@ -405,4 +478,6 @@ def compile_gemm2(
     launch.kernel_name = name
     launch.tile_n = TILE_N
     launch.ksplit = ksplit
+    launch.wide_bm = WIDE_BM if wide else None
+    launch.wide_sort_bm = WIDE_SORT_BM if wide else None
     return launch

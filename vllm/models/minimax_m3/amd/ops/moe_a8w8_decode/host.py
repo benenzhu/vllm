@@ -47,9 +47,11 @@ def a16w8_gemm1(
     topk_ids=None,
     zero_out=None,
     BM=BM,
+    wide=False,
 ):
     """Stage 1: gate/up GEMM + swiglu-OAI -> bf16 ``[sorted rows, D_INTER]``;
-    ``BM`` is the sort's row block (16 or 32)."""
+    ``BM`` is the sort's row block (16 or 32), ``wide`` the sort's wide-first
+    layout of the shared expert (sorted mode)."""
     launch = get_gemm1(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
@@ -58,6 +60,7 @@ def a16w8_gemm1(
         n_tokens=int(n_tokens),
         inline_sort=inline_sort,
         BM=BM,
+        wide=wide,
     )
     if inline_sort:
         assert int(n_tokens) <= BM and topk_ids is not None and zero_out is not None
@@ -73,7 +76,13 @@ def a16w8_gemm1(
             sorted_token_ids.data_ptr(),
         )
         zero_ptr, zero_dw = 0, 0
-    grid = max_m_blocks * (D_INTER // launch.tile_n)
+    if wide:
+        n_wide = (int(n_tokens) + launch.wide_bm - 1) // launch.wide_bm
+        grid = n_wide * launch.wide_n_blocks + (max_m_blocks - n_wide) * (
+            D_INTER // launch.tile_n
+        )
+    else:
+        grid = max_m_blocks * (D_INTER // launch.tile_n)
     _run_compiled(
         launch,
         x_bf16.data_ptr(),
@@ -113,9 +122,10 @@ def a16w8_gemm2(
     topk_ids=None,
     topk_weights=None,
     BM=BM,
+    wide=False,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16``
-    ``[n_tokens, D_HIDDEN]`` (zeroed beforehand); ``BM`` as for gemm1."""
+    ``[n_tokens, D_HIDDEN]`` (zeroed beforehand); ``BM`` / ``wide`` as for gemm1."""
     launch = get_gemm2(
         NE=NE,
         N_OUT=D_HIDDEN,
@@ -124,6 +134,7 @@ def a16w8_gemm2(
         inline_sort=inline_sort,
         TOPK=topk if inline_sort else None,
         BM=BM,
+        wide=wide,
     )
     if inline_sort:
         assert int(n_tokens) <= BM and topk_ids is not None and topk_weights is not None
@@ -135,7 +146,13 @@ def a16w8_gemm2(
         max_m_blocks = int(sorted_expert_ids.numel())
         eids_ptr, cumsum_ptr = sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr()
         stids_ptr, sw_ptr = sorted_token_ids.data_ptr(), sorted_weights.data_ptr()
-    grid = max_m_blocks * (D_HIDDEN // launch.tile_n) * launch.ksplit
+    nnb = D_HIDDEN // launch.tile_n
+    if wide:
+        n_sort_wide = (int(n_tokens) + launch.wide_sort_bm - 1) // launch.wide_sort_bm
+        n_wide = n_sort_wide * (launch.wide_sort_bm // launch.wide_bm)
+        grid = (n_wide + (max_m_blocks - n_sort_wide)) * nnb * launch.ksplit
+    else:
+        grid = max_m_blocks * nnb * launch.ksplit
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),
