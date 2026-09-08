@@ -27,6 +27,7 @@ pointers are used.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 
@@ -42,12 +43,15 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
 GEMM1_SWIGLU_ALPHA = 1.702
 GEMM1_SWIGLU_LIMIT = 7.0
 GEMM2_N_SPLIT = 4  # 32768 tokens: 1285 -> 1088 us with the rotated sweep; 4096 unchanged
-# gemm2 output mode (see gemm2.compile_moe_gemm2): "bf16" = token-major bf16
-# partials + aiter's moe_reduction (deterministic, the default); "atomic" = bf16
-# atomics into the output, no reduction (aiter's own way; sum order not
-# deterministic); "fp8" = MXFP8 partials + reduce_fp8 (deterministic, half the
-# partial traffic, one more quantization). The caller picks per call.
-GEMM2_OUT_MODE = "bf16"
+
+
+def default_out_mode() -> str:
+    """gemm2 output mode (see ``gemm2.compile_moe_gemm2``): "bf16" = token-major
+    bf16 partials + aiter's moe_reduction (deterministic); "fp8" = MXFP8 partials +
+    reduce_fp8 (deterministic, 3.5-5% faster, one more quantization). Follows the
+    switch aiter's own chain uses for its fp8 route-out, ``AITER_FLYDSL_STAGE2_FP8=1``
+    (read per call, like aiter); a caller may also pass ``out_mode`` explicitly."""
+    return "fp8" if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1" else "bf16"
 _GEMM1_BLOCK_K = 128
 _GEMM2_INTERMEDIATE = 768
 
@@ -125,14 +129,14 @@ def a8w8_prefill_moe(
 ) -> torch.Tensor:
     """One MoE layer for ``MIN_PREFILL_TOKENS <= M <= MAX_PREFILL_TOKENS``:
     stage 1 (sort, aiter fp8 quant, tile map, gemm1), then gemm2 + the reduction
-    of ``out_mode`` (default ``GEMM2_OUT_MODE``): "bf16" partials + aiter's
-    top-k reduction, "atomic" adds into a zeroed output, "fp8" partials +
-    ``reduce_fp8``. Returns ``[M, hidden_size]`` bf16."""
+    of ``out_mode`` (default ``default_out_mode()``): "bf16" partials + aiter's
+    top-k reduction, "fp8" partials + ``reduce_fp8``. Returns ``[M, hidden_size]``
+    bf16."""
     from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
     from .gemm2 import OUT_MODES, gemm2_grid
 
-    out_mode = GEMM2_OUT_MODE if out_mode is None else out_mode
+    out_mode = default_out_mode() if out_mode is None else out_mode
     assert out_mode in OUT_MODES, out_mode
     n_tokens = x.shape[0]
     topk = topk_ids.shape[1]
@@ -151,11 +155,7 @@ def a8w8_prefill_moe(
     )
     if out is None:
         out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=device)
-    if out_mode == "atomic":
-        out.zero_()
-        gemm2_out = out
-        partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
-    elif out_mode == "fp8":
+    if out_mode == "fp8":
         gemm2_out = torch.empty((n_tokens * topk, hidden_size), dtype=torch.uint8, device=device)
         partial_scale = torch.empty(
             (n_tokens * topk * (hidden_size // 32),), dtype=torch.uint8, device=device
@@ -184,8 +184,6 @@ def a8w8_prefill_moe(
         grid2,
         stream,
     )
-    if out_mode == "atomic":
-        return out
     if out_mode == "fp8":
         _run_compiled(
             _get_reduce_fp8(hidden_size, topk),

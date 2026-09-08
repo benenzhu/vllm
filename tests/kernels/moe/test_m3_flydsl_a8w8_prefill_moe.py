@@ -141,12 +141,10 @@ def test_a8w8_prefill_moe_matches_aiter(m3_weights, m):
     _check(m3_weights, m, "bf16")
 
 
-@pytest.mark.parametrize("out_mode", ["atomic", "fp8"])
-def test_a8w8_prefill_moe_out_modes(m3_weights, out_mode):
-    """gemm2's other output modes: bf16 atomics into the output (aiter's own way,
-    sum order not deterministic) and fp8 partials + reduce_fp8 (deterministic,
-    one more quantization)."""
-    _check(m3_weights, 4096, out_mode)
+def test_a8w8_prefill_moe_fp8_route_out(m3_weights):
+    """gemm2's fp8 output mode (AITER_FLYDSL_STAGE2_FP8=1): fp8 partials +
+    reduce_fp8, deterministic, one more quantization."""
+    _check(m3_weights, 4096, "fp8")
 
 
 def _check(m3_weights, m, out_mode):
@@ -168,11 +166,8 @@ def _check(m3_weights, m, out_mode):
     ref_aiter = _run_aiter(shuffled, x, topk_ids, topk_weights)
     torch.cuda.synchronize()
     assert out.shape == (m, HIDDEN) and out.dtype == torch.bfloat16
-    if out_mode != "atomic":
-        # deterministic: the same inputs give the same bits (a race shows up here)
-        assert torch.equal(out, out2)
-    else:
-        assert _cos(out, out2) > 0.99999
+    # deterministic: the same inputs give the same bits (a race shows up here)
+    assert torch.equal(out, out2)
     # aiter's a8w8 chain quantizes x and the intermediate the same way but its
     # stage 2 accumulates with bf16 atomics: cos 0.99999, not bit-identical; the
     # fp8 partials add one more quantization (cos ~0.9985)
