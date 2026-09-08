@@ -8,8 +8,9 @@
 Two output modes (``out_dtype``):
   "bf16"  the production layout: out[tok*topk + slot, :] = bf16(y *
   sorted_weights[row]),
-          reduced by aiter's ``moe_reduction_kernel`` (fp32 sum of the topk rows, then
-          bf16) -> the same numerics as production stage 2 + reduce.
+          reduced by ``reduce_bf16.py`` (fp32 sum of the topk rows, then bf16: aiter's
+          ``moe_reduction_kernel`` arithmetic) -> the same numerics as production
+          stage 2 + reduce.
   "fp8"   MXFP8 route-out: e4m3 of y / 2^(e-127) with one e8m0 per 32 columns
           (``OUT_scale``), routing weights deferred to ``reduce_fp8.py``. Halves the
           reduce traffic; kept as a switch (cf. aiter's AITER_FLYDSL_STAGE2_FP8).

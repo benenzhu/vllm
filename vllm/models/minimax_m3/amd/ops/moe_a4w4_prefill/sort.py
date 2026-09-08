@@ -31,7 +31,7 @@ import torch
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import range_constexpr
 
-SORT_CTAS = 32  # histogram / placement blocks
+SORT_CTAS = 128  # histogram / placement blocks (place_pad at 32768 tokens: 18 us with 32, 6 with 128)
 THREADS = 1024  # >= E and >= block_m
 
 
@@ -60,7 +60,7 @@ class SortBuffers:
         return SortBuffers(
             sorted_ids=torch.empty(ms, dtype=i32, device=device),
             sorted_expert_ids=torch.empty(ms // block_m, dtype=i32, device=device),
-            num_valid_ids=torch.zeros(2, dtype=i32, device=device),
+            num_valid_ids=torch.empty(2, dtype=i32, device=device),  # written by sort_cumsum
             sorted_weights=torch.empty(ms, dtype=torch.float32, device=device),
             block_offsets=torch.empty(E * SORT_CTAS, dtype=i32, device=device),
             real_counts=torch.empty(E, dtype=i32, device=device),

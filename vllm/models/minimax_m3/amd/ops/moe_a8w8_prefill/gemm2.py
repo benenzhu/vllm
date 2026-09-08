@@ -5,7 +5,7 @@ bf16 output:
 
     out[tok*topk + slot, :] = bf16( (h[row, :] @ W2[e]^T) * sorted_weights[row] )
 
-reduced by aiter's ``moe_reduction_kernel`` like production stage 2.
+reduced by ``moe_a4w4_prefill.reduce_bf16`` (aiter's ``moe_reduction`` arithmetic).
 
 Structure: the fp8 gemm1 mainloop (4-wave 2x2, LDS ping-pong, 128-K steps,
 ``v_mfma_scale_f32_16x16x128_f8f6f4``, AGPR accumulators) run as one flat
@@ -109,7 +109,7 @@ def compile_moe_gemm2(
     ``out_mode`` (the switch the a4w4 kernel has as ``out_dtype``; the package
     follows aiter's ``AITER_FLYDSL_STAGE2_FP8`` for the default):
       "bf16"    OUT [n_tokens*topk, H] bf16 = y * routing weight, token-major
-                partials for aiter's ``moe_reduction_kernel``; deterministic.
+                partials for ``moe_a4w4_prefill.reduce_bf16``; deterministic.
       "fp8"     OUT [n_tokens*topk, H] fp8 e4m3 + OUT_scale [n_tokens*topk, H/32]
                 e8m0 (unweighted, per 32 columns, ceil_pow2(amax/448)); the routing
                 weights are applied by ``reduce_fp8.py``. Half the partial traffic

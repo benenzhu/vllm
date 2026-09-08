@@ -8,8 +8,8 @@ At prefill sizes the aiter ``AITER_MXFP4_MXFP4`` path runs six kernels per
 MoE layer: routing sort, per-token fp4 quant, stage-1 GEMM (bf16 out), a
 separate fp4 quant of that intermediate, stage-2 GEMM writing the
 routing-weighted bf16 partials ``[M, topk, H]``, and the top-k reduction.
-This package keeps aiter's quant and reduction kernels and replaces the rest
-with three FlyDSL kernels that produce the same bits:
+This package keeps aiter's quant kernel and replaces the rest with FlyDSL
+kernels that produce the same bits:
 
 * ``sort``: aiter's 3-stage ``moe_sorting`` contract, without the zero-fill
   of a ``[M, H]`` buffer the non-atomic path never reads (32768 tokens: 146 ->
@@ -20,7 +20,9 @@ with three FlyDSL kernels that produce the same bits:
   with the swiglu-OAI activation and the per-32-column e8m0 quant of the
   intermediate fused into the epilogue, exactly aiter's rounding;
 * ``gemm2``: down fp4 GEMM, bf16 ``[M, topk, H]`` out with non-temporal stores
-  and a rotated n-tile sweep so neighbouring CTAs of one expert share W2 in L2.
+  and a rotated n-tile sweep so neighbouring CTAs of one expert share W2 in L2;
+* ``reduce_bf16``: the top-k sum of those partials (aiter's ``moe_reduction``
+  arithmetic; non-temporal loads, 32768 tokens standalone 451 -> 404 us).
 
 From 16384 tokens the sort uses 256-row blocks (gemm1 tiles 256 rows: half the
 W13 bytes per FLOP; gemm2 keeps 128-row tiles and skips the all-padding ones).
@@ -47,8 +49,8 @@ aiter path untouched:
   compiled and its buffers exercised once during those runs.
 
 MiniMax-M3 TP4 on MI355X, one MoE layer, HIP-graph replay of 4 different
-inputs (us; aiter ``fused_moe`` in brackets): 4096 402 (473), 8192 614 (742),
-16384 1059 (1328), 32768 1929 (2526) = 1.18 / 1.21 / 1.25 / 1.31x, the bf16
+inputs (us; aiter ``fused_moe`` in brackets): 4096 399 (473), 8192 599 (735),
+16384 1024 (1324), 32768 1891 (2504) = 1.19 / 1.23 / 1.29 / 1.32x, the bf16
 output bit-identical to aiter's.
 """
 
@@ -140,6 +142,13 @@ def _get_tile_map(intermediate_size: int, block_m: int):
 
 
 @functools.cache
+def _get_reduce_bf16(hidden_size: int, topk: int):
+    from .reduce_bf16 import compile_moe_reduce_bf16
+
+    return compile_moe_reduce_bf16(H=hidden_size, topk=topk)
+
+
+@functools.cache
 def _get_gemm1(
     hidden_size: int, intermediate_size: int, num_experts: int, block_m: int
 ):
@@ -193,7 +202,6 @@ def a4w4_prefill_moe(
     are used. ``topk_ids`` / ``topk_weights`` are ``[M, topk]`` with the fused
     shared expert included. Returns ``[M, hidden_size]`` bf16.
     """
-    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
     from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort
 
     from .gemm2 import gemm2_grid
@@ -284,11 +292,15 @@ def a4w4_prefill_moe(
         grid2,
         stream,
     )
-    # 6. aiter's top-k reduction (fp32 sum of the bf16 rows -> bf16)
+    # 6. top-k reduction (fp32 sum of the bf16 rows -> bf16)
     if out is None:
         out = torch.empty((n_tokens, hidden_size), dtype=torch.bfloat16, device=device)
-    _run_moe_reduction(
-        partial.view(n_tokens, topk, hidden_size), out, n_tokens, topk, hidden_size
+    _run_compiled(
+        _get_reduce_bf16(hidden_size, topk),
+        partial.view(-1),
+        out.view(-1),
+        n_tokens,
+        stream,
     )
     return out
 

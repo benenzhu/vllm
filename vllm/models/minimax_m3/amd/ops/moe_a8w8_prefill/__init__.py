@@ -7,15 +7,17 @@
 The MXFP8 layer (``ModelOptMxFp8FusedMoE``, backend AITER_MXFP8) runs aiter's
 a8w8 chain: routing sort, fused per-token fp8 quant, stage-1 GEMM writing the
 fp8 intermediate + e8m0 scales, stage-2 GEMM (bf16 ``[M, topk, H]`` partials
-or atomics) and the top-k reduction. This package keeps aiter's quant and
-reduction kernels and the ``moe_a4w4_prefill`` sort / tile map, and replaces
-the two GEMMs with the fp8 ports of the a4w4 prefill kernels:
+or atomics) and the top-k reduction. This package keeps aiter's quant kernel
+and the ``moe_a4w4_prefill`` sort / tile map / bf16 reduce, and replaces the
+two GEMMs with the fp8 ports of the a4w4 prefill kernels:
 
 * ``gemm1``: gate/up fp8 GEMM (4-wave 2x2, ``v_mfma_scale_f32_16x16x128_f8f6f4``
   with fp8 operands, AGPR accumulators, 128-K steps) with swiglu-OAI and the
   per-32-column MXFP8 quant of the intermediate fused into the epilogue; reads
   the gate/up-interleaved W13 the AITER_MXFP8 backend stores;
-* ``gemm2``: down fp8 GEMM, bf16 ``[M, topk, H]`` out (to be written).
+* ``gemm2``: down fp8 GEMM writing bf16 ``[M, topk, H]`` partials
+  (``out_mode="bf16"``, reduced by ``moe_a4w4_prefill.reduce_bf16``) or MXFP8
+  partials (``"fp8"``, reduced by ``reduce_fp8``).
 
 Weights: ``w13`` ``[E, 2I, H]`` fp8 e4m3 (``shuffle_weight(is_guinterleave=True,
 gate_up=True)``), ``w13_scale`` (``shuffle_scale(..., True, True)``), ``w2``
@@ -34,6 +36,7 @@ import torch
 from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
     MAX_PREFILL_TOKENS,
     MIN_PREFILL_TOKENS,
+    _get_reduce_bf16,
     _get_sort,
     _get_tile_map,
     _run_compiled,
@@ -47,8 +50,8 @@ GEMM2_N_SPLIT = 4  # 32768 tokens: 1285 -> 1088 us with the rotated sweep; 4096 
 
 def default_out_mode() -> str:
     """gemm2 output mode (see ``gemm2.compile_moe_gemm2``): "bf16" = token-major
-    bf16 partials + aiter's moe_reduction (deterministic); "fp8" = MXFP8 partials +
-    reduce_fp8 (deterministic, 3.5-5% faster, one more quantization). Follows the
+    bf16 partials + ``moe_a4w4_prefill.reduce_bf16`` (deterministic); "fp8" = MXFP8
+    partials + ``reduce_fp8`` (deterministic, faster, one more quantization). Follows the
     switch aiter's own chain uses for its fp8 route-out, ``AITER_FLYDSL_STAGE2_FP8=1``
     (read per call, like aiter); a caller may also pass ``out_mode`` explicitly."""
     return "fp8" if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1" else "bf16"
@@ -129,11 +132,9 @@ def a8w8_prefill_moe(
 ) -> torch.Tensor:
     """One MoE layer for ``MIN_PREFILL_TOKENS <= M <= MAX_PREFILL_TOKENS``:
     stage 1 (sort, aiter fp8 quant, tile map, gemm1), then gemm2 + the reduction
-    of ``out_mode`` (default ``default_out_mode()``): "bf16" partials + aiter's
-    top-k reduction, "fp8" partials + ``reduce_fp8``. Returns ``[M, hidden_size]``
-    bf16."""
-    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
-
+    of ``out_mode`` (default ``default_out_mode()``): "bf16" partials +
+    ``moe_a4w4_prefill.reduce_bf16``, "fp8" partials + ``reduce_fp8``. Returns
+    ``[M, hidden_size]`` bf16."""
     from .gemm2 import OUT_MODES, gemm2_grid
 
     out_mode = default_out_mode() if out_mode is None else out_mode
@@ -195,8 +196,12 @@ def a8w8_prefill_moe(
             stream,
         )
         return out
-    _run_moe_reduction(
-        gemm2_out.view(n_tokens, topk, hidden_size), out, n_tokens, topk, hidden_size
+    _run_compiled(
+        _get_reduce_bf16(hidden_size, topk),
+        gemm2_out.view(-1),
+        out.view(-1),
+        n_tokens,
+        stream,
     )
     return out
 
