@@ -150,19 +150,19 @@ class Mfma16x16x128Fp8:
             sb_index = lambda j, gu: (j, gu)  # noqa: E731
         thunks = list(interleave) if interleave else []
         lates = list(late) if late else []
-        nth, nlt, mth = [0], [0], [0]
         order = self._order()
         n_mfma = len(order)
-        slots = (
-            {(t * n_mfma) // len(thunks) for t in range(len(thunks))} if thunks else set()
-        )
+        # thunk t goes right after MFMA (t * n_mfma) // n_thunks: with more thunks
+        # than MFMAs several share a slot, so nothing is left to trail after the
+        # last MFMA (the a4w4 class issues one per MFMA and drains the rest at the
+        # end: 8-10 uncovered ds_reads per step in the hot-loop table)
+        by_slot = {}
+        for t, th in enumerate(thunks):
+            by_slot.setdefault((t * n_mfma) // len(thunks), []).append(th)
         n_late_slots = max(n_mfma - late_start, 1)
-        lslots = (
-            {late_start + (t * n_late_slots) // len(lates) for t in range(len(lates))}
-            if lates
-            else set()
-        )
-        for i, j in order:
+        for t, th in enumerate(lates):
+            by_slot.setdefault(late_start + (t * n_late_slots) // len(lates), []).append(th)
+        for m, (i, j) in enumerate(order):
             a_op = _pack8(a[i][0], a[i][1])
             b_op = _pack8(b[j][0], b[j][1])
             acc = None if zero_acc else c[self.idx(i, j)]
@@ -170,19 +170,11 @@ class Mfma16x16x128Fp8:
             c[self.idx(i, j)] = self._mfma_agpr(
                 a_op, b_op, acc, sa[i // 2], sb[sbj], i % 2, sbb, k2
             )
-            if nth[0] < len(thunks) and mth[0] in slots:
-                thunks[nth[0]]()
-                nth[0] += 1
-            if nlt[0] < len(lates) and mth[0] in lslots:
-                lates[nlt[0]]()
-                nlt[0] += 1
-            mth[0] += 1
-        while nth[0] < len(thunks):
-            thunks[nth[0]]()
-            nth[0] += 1
-        while nlt[0] < len(lates):
-            lates[nlt[0]]()
-            nlt[0] += 1
+            for th in by_slot.get(m, ()):
+                th()
+        for m in range(n_mfma, n_mfma + max(len(thunks), len(lates)) + late_start + 1):
+            for th in by_slot.get(m, ()):
+                th()
         return c
 
     def _mfma_agpr(self, a_op, b_op, acc, sa_v, sb_v, ia, jb, k2):
