@@ -28,7 +28,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from .utils import _global_i32_ptr, _maxf_nn, _xlane_max4_pair
+from .utils import _global_i32_ptr, _maxf_nn, _wave_prefix_sum_i32, _xlane_max4_pair
 
 NW = 4  # waves per workgroup
 WAVES = 4096  # graph-constant wave budget
@@ -43,12 +43,11 @@ import os
 
 _KNOBS = set(filter(None, os.environ.get("M3_IDX_KNOBS", "").split(",")))
 K_CACHE_MOD = 0 if "nont" in _KNOBS else 2  # non-temporal K loads
-ROWLOAD = "rowload" in _KNOBS  # diagnostic: row-contiguous 1 KB loads (wrong data) to price the request count
-MAX_REQS = 256
+MAX_REQS = 64  # one lane per request in the wave-parallel work split
 
 
 def compile_score_decode():
-    name = f"m3_index_score_decode_bf16_w{WAVES}_ring{RING}" + "".join("_" + k for k in sorted(_KNOBS))
+    name = f"m3_index_score_decode_bf16_v2_w{WAVES}_ring{RING}" + "".join("_" + k for k in sorted(_KNOBS))
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -74,47 +73,31 @@ def compile_score_decode():
         seq = _global_i32_ptr(arg_seq)
         bt = _global_i32_ptr(arg_bt)
 
-        # total blocks over the requests -> blocks per wave
-        for riv, st in range(fx.Index(0), fx.Index(i32_nreq), fx.Index(1), init=[fx.Int32(0).ir_value()]):
-            tot = fx.Int32(st if not isinstance(st, (list, tuple)) else st[0])
-            L = fx.Int32(seq[fx.Int32(riv)])
-            L = (L > 0).select(L, fx.Int32(0))
-            tot = tot + (L + (BLK - 1)) // BLK
-            res = yield [tot.ir_value()]
-        total_blocks = fx.Int32(res if not isinstance(res, (list, tuple)) else res[0])
+        # work split, one lane per request: blocks per request, wave sum -> blocks per
+        # wave, waves per request, prefix sum -> the request that owns this wave
+        has = lane < i32_nreq
+        L_l = fx.Int32(seq[has.select(lane, fx.Int32(0))])
+        L_l = (has & (L_l > 0)).select(L_l, fx.Int32(0))
+        nb_l = (L_l + (BLK - 1)) // BLK
+        incl_nb = _wave_prefix_sum_i32(nb_l, lane)
+        total_blocks = fx.Int32(fx.rocdl.readlane(T.i32, incl_nb, 63))
         bpw = (total_blocks + (WAVES - 1)) // WAVES
         bpw = (bpw > 0).select(bpw, fx.Int32(1))
-        # my request: waves are handed out request by request, cdiv(blocks, bpw) each
-        zero = fx.Int32(0)
-        for riv, st in range(
-            fx.Index(0),
-            fx.Index(i32_nreq),
-            fx.Index(1),
-            init=[zero.ir_value(), fx.Int32(-1).ir_value(), zero.ir_value(), zero.ir_value()],
-        ):
-            off = fx.Int32(st[0])
-            my_r = fx.Int32(st[1])
-            my_w = fx.Int32(st[2])
-            my_nb = fx.Int32(st[3])
-            r = fx.Int32(riv)
-            L = fx.Int32(seq[r])
-            L = (L > 0).select(L, fx.Int32(0))
-            nb = (L + (BLK - 1)) // BLK
-            nw = (nb + bpw - 1) // bpw
-            owns = (wid >= off) & (wid < off + nw)
-            my_r = owns.select(r, my_r)
-            my_w = owns.select(wid - off, my_w)
-            my_nb = owns.select(nb, my_nb)
-            off = off + nw
-            res = yield [off.ir_value(), my_r.ir_value(), my_w.ir_value(), my_nb.ir_value()]
-        r = fx.Int32(res[1])
-        my_w = fx.Int32(res[2])
-        nb = fx.Int32(res[3])
+        nw_l = (nb_l + bpw - 1) // bpw
+        incl_nw = _wave_prefix_sum_i32(nw_l, lane)
+        off_l = incl_nw - nw_l
+        owns = has & (wid >= off_l) & (wid < off_l + nw_l)
+        own_mask = fx.Int64(fx.rocdl.ballot(T.i64, owns))
+        r = fx.Int64(fx.math.cttz(own_mask)).to(fx.Int32)
+        r = (own_mask != 0).select(r, fx.Int32(-1))
+        r_ok = (own_mask != 0).select(r, fx.Int32(0))
+        my_w = wid - fx.Int32(fx.rocdl.readlane(T.i32, off_l, r_ok))
+        nb = fx.Int32(fx.rocdl.readlane(T.i32, nb_l, r_ok))
+        L = fx.Int32(fx.rocdl.readlane(T.i32, L_l, r_ok))
         if r >= 0:
             blk0 = my_w * bpw
             blk1e = blk0 + bpw
             blk1 = (blk1e < nb).select(blk1e, nb)
-            L = fx.Int32(seq[r])
             qr = buffer_ops.create_buffer_resource_from_addr(
                 arg_q, num_records_bytes=fx.Int64(i32_total_q) * (D * 2)
             )
@@ -149,41 +132,24 @@ def compile_score_decode():
 
             def page_of(blk):
                 bi = (blk < nb).select(blk, last_blk)
-                return fx.Int32(bt[bt_row + bi])
+                return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(bt[bt_row + bi])))
 
             # A fragment loads of M-tile pair p: rows (2p + t)*16 + l16, 16 B at
-            # ku*64 + q16*16
-            a_off = l16 * (D * 2) + q16 * 16
-
-            row_off = ((lane // 16) * (D * 2) + (lane % 16) * 16) // 4  # 4 rows x 256 B per instruction
+            # ku*64 + q16*16. One lane offset (dwords); the page and the M-tile go in
+            # soffset (SGPR), ku*64 folds into the instruction offset field.
+            a_off = (l16 * (D * 2) + q16 * 16) // 4
 
             def load_pair(page, p):
-                base = page * (BLOCK_BYTES // 4)
-                if ROWLOAD:
-                    return [
-                        [
-                            fx.Vector(
-                                buffer_ops.buffer_load(
-                                    kr,
-                                    base + row_off + ((2 * p + t) * 16 * (D * 2) + ku * 1024) // 4,
-                                    vec_width=4,
-                                    dtype=fx.Int32,
-                                    cache_modifier=K_CACHE_MOD,
-                                )
-                            )
-                            for ku in range_constexpr(KU)
-                        ]
-                        for t in range_constexpr(2)
-                    ]
                 return [
                     [
                         fx.Vector(
                             buffer_ops.buffer_load(
                                 kr,
-                                base + (a_off + (2 * p + t) * 16 * (D * 2) + ku * 64) // 4,
+                                a_off + ku * 16,
                                 vec_width=4,
                                 dtype=fx.Int32,
                                 cache_modifier=K_CACHE_MOD,
+                                soffset_bytes=page * BLOCK_BYTES + (2 * p + t) * 16 * (D * 2),
                             )
                         )
                         for ku in range_constexpr(KU)

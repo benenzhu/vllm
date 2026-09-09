@@ -82,3 +82,23 @@ def _xlane_max4_pair(x, y):
     big = _bits(_maxf_nn(_as_f32(a), _as_f32(b)))
     a, b = _permlane32_swap(big, big)
     return _as_f32(a), _as_f32(b)
+
+
+# DPP controls: row_shr:n = 0x110 + n (16-lane rows)
+_DPP_ROW_SHR = ((1, 0x111), (2, 0x112), (4, 0x114), (8, 0x118))
+
+
+def _wave_prefix_sum_i32(val, lane):
+    """Inclusive prefix sum over the 64 lanes: 4 DPP row_shr steps inside the
+    16-lane rows, then two ds_bpermute steps across rows (aiter moe_sorting's
+    ``_dpp_intra_wave_prefix_sum``)."""
+    zero_raw = fx.as_ir_value(fx.Int32(0))
+    for shift, ctrl in _DPP_ROW_SHR:
+        remote = _rocdl.update_dpp(_T.i32, zero_raw, fx.as_ir_value(val), ctrl, 0xF, 0xF, True)
+        val = (lane >= shift).select(val + fx.Int32(remote), val)
+    src16 = (lane & 0x30) - 1
+    r16 = fx.Int32(_rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src16 * 4), fx.as_ir_value(val)))
+    val = (lane >= 16).select(val + r16, val)
+    src32 = (lane & 0x30) - 17
+    r32 = fx.Int32(_rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src32 * 4), fx.as_ir_value(val)))
+    return (lane >= 32).select(val + r32, val)

@@ -62,10 +62,12 @@ ACC2 = "acc2" in _KNOBS
 # K-path cost split: bar_only = fake_k + a barrier per block; load_only = K loads issued and
 # waited, no LDS write; write_only = LDS writes of the (stale) registers, no loads
 BAR_ONLY = "bar_only" in _KNOBS
+KNT = "knt" in _KNOBS  # non-temporal K loads
 LOAD_ONLY = "load_only" in _KNOBS
 WRITE_ONLY = "write_only" in _KNOBS
 N_XCD = 8
-N_SLOTS = 3 if PF2 else 2
+STAGE2 = "stage2" in _KNOBS
+N_SLOTS = 4 if STAGE2 else (3 if PF2 else 2)
 LDS_BYTES = N_SLOTS * SLOT_T * 16
 GROUP = 4  # blocks buffered per score store (16 B per row)
 NI = ROWS_PER_WAVE // 16  # N-tiles (query rows) per wave
@@ -101,6 +103,9 @@ def compile_score_prefill():
         i64_kv_bytes: fx.Int64,
         i32_nb: fx.Int32,
     ):
+        # knobs as locals: closure scalars of the helpers below, so they are part of
+        # the FlyDSL compile-cache key (module globals used only in helpers are not)
+        k_no_store, k_afpf, k_acc2, k_load_only, k_knt = NO_STORE, AFPF, ACC2, LOAD_ONLY, KNT
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx, pid = fx.thread_idx.x, fx.block_idx.x
         lane = tx % 64
@@ -201,21 +206,36 @@ def compile_score_prefill():
                 def load_block(blk):
                     bi = (blk < nblk).select(blk, last_blk)  # past the end: reread
                     page = fx.Int32(bt[bt_row + bi])
-                    base = page * (BLOCK_BYTES // 4)
+                    # one 32 KB buffer resource per block (64-bit base: the index cache
+                    # may exceed 4 GB); chunk j of thread tx at (j*256 + tx) * 16 B
+                    kr = buffer_ops.create_buffer_resource_from_addr(
+                        arg_kv + fx.Int64(page) * BLOCK_BYTES, num_records_bytes=BLOCK_BYTES
+                    )
                     return [
                         fx.Vector(
                             buffer_ops.buffer_load(
                                 kr,
-                                base + (j * (64 * NW) + tx) * 4,
+                                tx * 4,
                                 vec_width=4,
                                 dtype=fx.Int32,
+                                cache_modifier=2 if k_knt else 0,
+                                soffset_bytes=j * (64 * NW * 16),
                             )
                         )
                         for j in range_constexpr(CHUNKS)
                     ]
 
+                def stage_two(regs_a, slot_a, regs_b, slot_b):
+                    """two blocks into two slots, one barrier"""
+                    for j in range_constexpr(CHUNKS):
+                        lds_store16(slot_a * SLOT_T + st_tiles[j], regs_a[j])
+                    for j in range_constexpr(CHUNKS):
+                        lds_store16(slot_b * SLOT_T + st_tiles[j], regs_b[j])
+                    fx.rocdl.s_waitcnt(lgkmcnt=0)
+                    fx.gpu.barrier()
+
                 def stage_block(regs, slot):
-                    if const_expr(LOAD_ONLY):
+                    if const_expr(k_load_only):
                         # wait for the loads (a fake dependency: keep one dword) then barrier
                         keep = regs[0][0]
                         for j in range_constexpr(1, CHUNKS):
@@ -259,7 +279,7 @@ def compile_score_prefill():
                             fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
                             for _ in range(NI)
                         ]
-                        for _ in range(2 if ACC2 else 1)
+                        for _ in range(2 if k_acc2 else 1)
                     ]
 
                     def issue(mt, a):
@@ -279,23 +299,23 @@ def compile_score_prefill():
                                 x = (vis[ni] >= mt * 16 + i).select(v[i], neg_inf)
                                 run[ni] = _maxf_nn(run[ni], x)
 
-                    if const_expr(AFPF):
+                    if const_expr(k_afpf):
                         a_next = read_a(0)
                     for mt in range_constexpr(MT):
-                        if const_expr(AFPF):
+                        if const_expr(k_afpf):
                             a = a_next
                             if const_expr(mt + 1 < MT):
                                 a_next = read_a(mt + 1)
                         else:
                             a = read_a(mt)
                         issue(mt, a)
-                        if const_expr(ACC2):
+                        if const_expr(k_acc2):
                             # the previous M-tile's max/mask runs under these MFMAs
                             if const_expr(mt >= 1):
                                 reduce(mt - 1)
                         else:
                             reduce(mt)
-                    if const_expr(ACC2):
+                    if const_expr(k_acc2):
                         reduce(MT - 1)
                     out = []
                     for p in range_constexpr(NI // 2):
@@ -306,7 +326,7 @@ def compile_score_prefill():
                 def store_group(g0, sc):
                     """sc[j][ni]: scores of blocks g0..g0+3. Lane q16 = k stores rows
                     ni = 2k, 2k+1, 16 B per row (single dwords for a partial tail)."""
-                    if const_expr(NO_STORE):
+                    if const_expr(k_no_store):
                         return
                     full = g0 + GROUP <= blk1
                     for h in range_constexpr(2):
@@ -355,6 +375,23 @@ def compile_score_prefill():
                         for j in range_constexpr(GROUP):
                             sc.append(compute_block(j % N_SLOTS, g0 + j))
                             stage_block(regs0, (j + 1) % N_SLOTS)
+                        store_group(g0, sc)
+                elif const_expr(STAGE2):
+                    # slots (blk - blk0) % 4; blocks g0, g0+1 staged at group start; the
+                    # loads of g0+2, g0+3 go out before compute(g0), are staged after
+                    # compute(g0+1) (one barrier), then g0+4, g0+5 likewise
+                    stage_two(load_block(blk0), 0, load_block(blk0 + 1), 1)
+                    for g in range(0, n_groups):
+                        g0 = blk0 + fx.Int32(g) * GROUP
+                        sc = []
+                        for half in range_constexpr(2):
+                            b0 = g0 + half * 2
+                            s0 = (half * 2) % N_SLOTS
+                            nxt_a = load_block(b0 + 2)
+                            nxt_b = load_block(b0 + 3)
+                            sc.append(compute_block(s0, b0))
+                            sc.append(compute_block(s0 + 1, b0 + 1))
+                            stage_two(nxt_a, (s0 + 2) % N_SLOTS, nxt_b, (s0 + 3) % N_SLOTS)
                         store_group(g0, sc)
                 elif const_expr(PF2):
                     # three slots, slot(blk) = (blk - blk0) % 3; blocks g0, g0+1 staged at

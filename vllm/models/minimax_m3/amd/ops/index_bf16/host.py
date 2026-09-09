@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from . import score_decode, score_prefill, score_prefill_direct, score_prefill_w4b, score_prefill_w8
+from . import score_decode, score_decode_v3, score_prefill, score_prefill_direct, score_prefill_w4b, score_prefill_w8
 from .topk_prefill import NW as TOPK_ROWS_PER_WG
 from .topk_prefill import TOPK, compile_topk_prefill
 from .utils import _run_compiled
@@ -65,7 +65,6 @@ def index_score_prefill(
     assert idx_q.stride(2) == 1 and idx_q.stride(0) == head_dim
     assert index_kv_cache.is_contiguous() and tuple(index_kv_cache.shape[1:]) == (128, 128)
     kv_bytes = index_kv_cache.numel() * 2
-    assert kv_bytes <= 0xFFFFFFFF, "buffer resources address 4 GB"
     for t in (block_table, cu_seqlens_q, seq_lens, prefix_lens):
         assert t.dtype == torch.int32 and t.stride(-1) == 1
     batch = cu_seqlens_q.shape[0] - 1
@@ -137,9 +136,14 @@ def index_topk_prefill(
     return topk_idx
 
 
+DECODE = os.environ.get("M3_IDX_DECODE", "v3")  # lab switch
+
+
 @functools.cache
 def get_score_decode():
-    return score_decode.compile_score_decode()
+    if DECODE == "v1":
+        return score_decode.compile_score_decode()
+    return score_decode_v3.compile_score_decode_v3()
 
 
 def index_score_decode(
@@ -157,12 +161,11 @@ def index_score_decode(
     total_q, num_idx_heads, head_dim = idx_q.shape
     num_reqs = seq_lens.shape[0]
     assert num_idx_heads == 1 and head_dim == 128 and total_q == num_reqs * decode_query_len
-    assert 1 <= decode_query_len <= 16 and num_reqs <= score_decode.MAX_REQS
+    assert 1 <= decode_query_len <= 16 and num_reqs <= score_decode.MAX_REQS, num_reqs
     assert idx_q.dtype == torch.bfloat16 and index_kv_cache.dtype == torch.bfloat16
     assert idx_q.stride(2) == 1 and idx_q.stride(0) == head_dim
     assert index_kv_cache.is_contiguous() and tuple(index_kv_cache.shape[1:]) == (128, 128)
     kv_bytes = index_kv_cache.numel() * 2
-    assert kv_bytes <= 0xFFFFFFFF
     assert block_table.dtype == torch.int32 and seq_lens.dtype == torch.int32
     assert block_table.stride(1) == 1 and seq_lens.is_contiguous()
     max_block = _cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
