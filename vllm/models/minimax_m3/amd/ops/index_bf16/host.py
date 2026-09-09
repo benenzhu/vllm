@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from . import score_decode, score_decode_v3, score_prefill, score_prefill_direct, score_prefill_w4b, score_prefill_w8, score_prefill_wp
+from . import score_decode, score_decode_v3, score_prefill, score_prefill_direct, score_prefill_w4b, score_prefill_w8, score_prefill_wp, score_prefill_dma
 from .topk_prefill import NW as TOPK_ROWS_PER_WG
 from .topk_prefill import TOPK, compile_topk_prefill
 from .utils import _run_compiled
@@ -24,8 +24,8 @@ def _cdiv(a, b):
 
 
 # lab switch between the 4-wave (512-row) and 8-wave (1024-row) scorers
-SCORER = os.environ.get("M3_IDX_SCORER", "w4b")
-_scorer_mod = {"w4": score_prefill, "w4b": score_prefill_w4b, "w8": score_prefill_w8, "direct": score_prefill_direct, "wp": score_prefill_wp}[SCORER]
+SCORER = os.environ.get("M3_IDX_SCORER", "dma")
+_scorer_mod = {"w4": score_prefill, "w4b": score_prefill_w4b, "w8": score_prefill_w8, "direct": score_prefill_direct, "wp": score_prefill_wp, "dma": score_prefill_dma}[SCORER]
 TILE_Q, GROUP = _scorer_mod.TILE_Q, _scorer_mod.GROUP
 MAX_SEGMENTS = 256 if SCORER == "w8" else 64
 
@@ -40,6 +40,8 @@ def get_score_prefill():
         return score_prefill_direct.compile_score_prefill_direct()
     if SCORER == "wp":
         return score_prefill_wp.compile_score_prefill_wp()
+    if SCORER == "dma":
+        return score_prefill_dma.compile_score_prefill_dma()
     return score_prefill_w8.compile_score_prefill_w8()
 
 
