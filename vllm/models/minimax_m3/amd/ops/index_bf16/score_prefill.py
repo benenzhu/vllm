@@ -205,7 +205,10 @@ def compile_score_prefill():
 
                 def load_block(blk):
                     bi = (blk < nblk).select(blk, last_blk)  # past the end: reread
-                    page = fx.Int32(bt[bt_row + bi])
+                    # the page id is wave-uniform: say so, or the compiler wraps every
+                    # load of the block in a waterfall loop (readfirstlane, v_cmp_eq_u64,
+                    # saveexec, branch) for the descriptor it cannot prove uniform
+                    page = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(bt[bt_row + bi])))
                     # one 32 KB buffer resource per block (64-bit base: the index cache
                     # may exceed 4 GB); chunk j of thread tx at (j*256 + tx) * 16 B
                     kr = buffer_ops.create_buffer_resource_from_addr(
@@ -259,11 +262,14 @@ def compile_score_prefill():
                     t.store(v8)
                     return t
 
-                def compute_block(slot, blk):
+                def compute_block(slot, blk, masked):
                     """Block scores of this wave's 128 rows (8 values per lane,
-                    identical across the 4 q16 lanes)."""
+                    identical across the 4 q16 lanes). ``masked`` (compile-time):
+                    apply the causal select; False for blocks every row of the tile
+                    sees whole (the max is then 1 VALU per MFMA instead of 3)."""
                     # tokens visible to row ni: q16*4 + mt*16 + i <= qpos - blk*128
-                    vis = [qpos[ni] - (blk * BLK + q16 * 4) for ni in range_constexpr(NI)]
+                    if const_expr(masked):
+                        vis = [qpos[ni] - (blk * BLK + q16 * 4) for ni in range_constexpr(NI)]
                     run = [neg_inf for _ in range(NI)]
 
                     def read_a(mt):
@@ -296,7 +302,9 @@ def compile_score_prefill():
                         for ni in range_constexpr(NI):
                             v = acc[ni].load()
                             for i in range_constexpr(4):
-                                x = (vis[ni] >= mt * 16 + i).select(v[i], neg_inf)
+                                x = v[i]
+                                if const_expr(masked):
+                                    x = (vis[ni] >= mt * 16 + i).select(x, neg_inf)
                                 run[ni] = _maxf_nn(run[ni], x)
 
                     if const_expr(k_afpf):
@@ -362,7 +370,7 @@ def compile_score_prefill():
                         g0 = blk0 + fx.Int32(g) * GROUP
                         sc = []
                         for j in range_constexpr(GROUP):
-                            sc.append(compute_block(0, g0 + j))
+                            sc.append(compute_block(0, g0 + j, True))
                             if const_expr(BAR_ONLY):
                                 fx.gpu.barrier()
                         store_group(g0, sc)
@@ -373,7 +381,7 @@ def compile_score_prefill():
                         g0 = blk0 + fx.Int32(g) * GROUP
                         sc = []
                         for j in range_constexpr(GROUP):
-                            sc.append(compute_block(j % N_SLOTS, g0 + j))
+                            sc.append(compute_block(j % N_SLOTS, g0 + j, True))
                             stage_block(regs0, (j + 1) % N_SLOTS)
                         store_group(g0, sc)
                 elif const_expr(STAGE2):
@@ -389,8 +397,8 @@ def compile_score_prefill():
                             s0 = (half * 2) % N_SLOTS
                             nxt_a = load_block(b0 + 2)
                             nxt_b = load_block(b0 + 3)
-                            sc.append(compute_block(s0, b0))
-                            sc.append(compute_block(s0 + 1, b0 + 1))
+                            sc.append(compute_block(s0, b0, True))
+                            sc.append(compute_block(s0 + 1, b0 + 1, True))
                             stage_two(nxt_a, (s0 + 2) % N_SLOTS, nxt_b, (s0 + 3) % N_SLOTS)
                         store_group(g0, sc)
                 elif const_expr(PF2):
@@ -407,7 +415,7 @@ def compile_score_prefill():
                         for j in range_constexpr(GROUP):
                             blk = g0 + j
                             pend.append((load_block(blk + 2), (s0 + j + 2) % N_SLOTS))
-                            sc.append(compute_block((s0 + j) % N_SLOTS, blk))
+                            sc.append(compute_block((s0 + j) % N_SLOTS, blk, True))
                             if const_expr(j >= 1):
                                 regs, slot = pend.pop(0)
                                 stage_block(regs, slot)
@@ -415,16 +423,29 @@ def compile_score_prefill():
                         stage_block(regs, slot)
                         store_group(g0, sc)
                 else:
-                    stage_block(load_block(blk0), 0)
-                    for g in range(0, n_groups):
-                        g0 = blk0 + fx.Int32(g) * GROUP
+                    # groups whose 4 blocks every row of the tile sees whole (block
+                    # blk*128+127 <= prefix + row0) need no causal select: all but the
+                    # last group or two of a request's causal window
+                    v = prefix + row0 - (BLK - 1)
+                    last_full = (v < 0).select(fx.Int32(-1), v // BLK)
+                    d = last_full - (GROUP - 1) - blk0
+                    nf = (d < 0).select(fx.Int32(0), d // GROUP + 1)
+                    n_full = (nf < n_groups).select(nf, n_groups)
+
+                    def group(g0, masked):
                         sc = []
                         for j in range_constexpr(GROUP):
                             blk = g0 + j
                             nxt = load_block(blk + 1)  # in flight during this block's MFMAs
-                            sc.append(compute_block(j % N_SLOTS, blk))
+                            sc.append(compute_block(j % N_SLOTS, blk, masked))
                             stage_block(nxt, (j + 1) % N_SLOTS)
                         store_group(g0, sc)
+
+                    stage_block(load_block(blk0), 0)
+                    for g in range(0, n_full):
+                        group(blk0 + fx.Int32(g) * GROUP, False)
+                    for g in range(n_full, n_groups):
+                        group(blk0 + fx.Int32(g) * GROUP, True)
 
     @flyc.jit
     def launch(
