@@ -38,7 +38,7 @@ aiter path untouched:
   parallelism, ``apply_router_weight_on_input`` off;
 * hidden size a multiple of 1024, per-partition intermediate size 768
   (gemm2's K pipeline is written for 3 K-steps of 256; MiniMax-M3 at TP4);
-* at call time: ``3072 <= M <= 32768`` contiguous bf16 tokens and no unfused
+* at call time: ``3072 <= M <= 65536`` contiguous bf16 tokens and no unfused
   shared experts. Below 3072 tokens aiter's small-batch configuration is
   faster (512: 205 vs 289 us, 2048: 316 vs 326); the decode package covers
   ``M <= 256``;
@@ -50,8 +50,10 @@ aiter path untouched:
 
 MiniMax-M3 TP4 on MI355X, one MoE layer, HIP-graph replay of 4 different
 inputs (us; aiter ``fused_moe`` in brackets): 4096 399 (473), 8192 599 (735),
-16384 1024 (1324), 32768 1891 (2504) = 1.19 / 1.23 / 1.29 / 1.32x, the bf16
-output bit-identical to aiter's.
+16384 1024 (1324), 32768 1891 (2504), 65536 3584 (4820) = 1.19 / 1.23 / 1.29 /
+1.32 / 1.34x, the bf16 output bit-identical to aiter's. 65536 tokens is the
+addressing limit: the bf16 partials are then 4.03 GB, and the kernels' i32 byte
+offsets and record counts, read as u32 by the buffer instructions, reach 4 GB.
 """
 
 from __future__ import annotations
@@ -65,7 +67,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 MIN_PREFILL_TOKENS = 3072
-MAX_PREFILL_TOKENS = 32768
+MAX_PREFILL_TOKENS = 65536
 BM256_FROM_TOKENS = 16384  # sort / gemm1 block of 256 rows from here up
 GEMM2_N_SPLIT = 2
 GEMM1_SWIGLU_ALPHA = 1.702

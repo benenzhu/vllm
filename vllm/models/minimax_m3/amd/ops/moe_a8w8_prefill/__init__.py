@@ -45,7 +45,17 @@ from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
 
 GEMM1_SWIGLU_ALPHA = 1.702
 GEMM1_SWIGLU_LIMIT = 7.0
-GEMM2_N_SPLIT = 4  # 32768 tokens: 1285 -> 1088 us with the rotated sweep; 4096 unchanged
+# CTAs sharing one m-block's 24 n-tiles in gemm2 (see ``gemm2.compile_moe_gemm2``).
+# gemm2 alone, MI355X: 6 beats 4 by 4-9% up to 16384 tokens (512: 177 -> 167 us,
+# 4096: 234 -> 230, 16384: 621 -> 591); 4 wins from 32768 (1069 vs 1077, 65536:
+# 2027 vs 2062), where the rotated n-tile sweep already fills the machine.
+GEMM2_N_SPLIT = 6
+GEMM2_N_SPLIT_LARGE = 4
+GEMM2_N_SPLIT_LARGE_FROM_TOKENS = 32768
+
+
+def gemm2_n_split_for(n_tokens: int) -> int:
+    return GEMM2_N_SPLIT_LARGE if n_tokens >= GEMM2_N_SPLIT_LARGE_FROM_TOKENS else GEMM2_N_SPLIT
 
 
 def default_out_mode() -> str:
@@ -93,6 +103,7 @@ def _get_gemm2(
     num_experts: int,
     topk: int,
     block_m: int,
+    n_split: int,
     out_mode: str,
 ):
     from .gemm2 import compile_moe_gemm2
@@ -102,7 +113,7 @@ def _get_gemm2(
         I=intermediate_size,
         E=num_experts,
         topk=topk,
-        n_split=GEMM2_N_SPLIT,
+        n_split=n_split,
         sort_block_m=block_m,
         out_mode=out_mode,
     )
@@ -167,12 +178,17 @@ def a8w8_prefill_moe(
         )
         partial_scale = torch.empty((16,), dtype=torch.uint8, device=device)
     num_m_blocks2 = (num_m_blocks * bm) // 128
-    grid2 = gemm2_grid(num_m_blocks2, GEMM2_N_SPLIT)
+    n_split = gemm2_n_split_for(n_tokens)
+    grid2 = gemm2_grid(num_m_blocks2, n_split)
+    # The bf16 partials reach 4.03 GB at 65536 tokens: they are passed by their
+    # own element view (a byte view has more than 2^31 elements), and gemm2 /
+    # reduce_bf16 address them with i32 byte offsets and record counts that wrap
+    # past 2^31 -- the buffer instructions read both as u32, so 4 GB is the limit.
     _run_compiled(
-        _get_gemm2(hidden_size, intermediate_size, num_experts, topk, bm, out_mode),
+        _get_gemm2(hidden_size, intermediate_size, num_experts, topk, bm, n_split, out_mode),
         h_q.view(-1),
         _u8_flat(w2),
-        _u8_flat(gemm2_out),
+        gemm2_out.view(-1),
         h_s,
         _u8_flat(w2_scale),
         partial_scale,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiniMax-M3 FlyDSL a8w8 prefill MoE (gfx950, MXFP8 weights and activations,
-3072 <= M <= 32768).
+3072 <= M <= 65536).
 
 Weights are quantized to MXFP8 (fp8 e4m3 + per-32 e8m0, the checkpoint format)
 and shuffled exactly like ``ModelOptMxFp8FusedMoE`` does for the AITER_MXFP8

@@ -23,7 +23,7 @@ import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 
 _THREADS = 256
-_MAX_BLOCKS = 4096  # >= max_sorted / BM at 32768 tokens (1409)
+_MAX_BLOCKS = 4096  # >= max_sorted / BM: 1409 at 32768 tokens (BM 128) and at 65536 (BM 256)
 _SEARCH_STEPS = 13  # 2^13 > _MAX_BLOCKS
 
 

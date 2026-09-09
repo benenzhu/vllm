@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """MiniMax-M3 FlyDSL prefill MoE (gfx950, MXFP4 weights and activations,
-3072 <= M <= 32768).
+3072 <= M <= 65536).
 
 Weights are quantized and shuffled like the AITER_MXFP4_MXFP4 backend does at
 load time (shuffle_weights + e8m0_shuffle, gate/up rows separated), routing
