@@ -23,7 +23,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T
 
@@ -72,7 +72,7 @@ def _f32_to_ord(v):
 
 
 def compile_topk_prefill():
-    name = f"m3_index_topk_prefill_k{TOPK}_nw{NW}_c{CHUNK}_pf{PF_CHUNKS}_v2"
+    name = f"m3_index_topk_prefill_k{TOPK}_nw{NW}_c{CHUNK}_pf{PF_CHUNKS}_v3"
 
     @flyc.kernel(name=name, known_block_size=[64 * NW, 1, 1])
     def kernel(
@@ -116,23 +116,30 @@ def compile_topk_prefill():
                     )
                 )
 
-            def unpack(v4, c):
+            def unpack(v4, c, full):
+                """ord keys of the chunk's 4 values per lane. ``full``: the first and
+                the last chunk carry the init / local overrides, the visible-block
+                bound and the NaN map; the chunks between are all visible finite
+                scores (the scorer masks with -inf, never NaN)."""
                 col0 = c * CHUNK + lane * 4
                 ords, cols = [], []
                 for j in range_constexpr(4):
                     col = col0 + j
                     v = v4[j]
-                    bits = v.bitcast(fx.Int32)
-                    is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
-                    v = is_nan.select(f_nan, v)
-                    v = (col >= loc0).select(f_local, v)
-                    v = (col < i32_init).select(f_init, v)
-                    ords.append((col < vb).select(_f32_to_ord(v), int_min))
+                    if const_expr(full):
+                        bits = v.bitcast(fx.Int32)
+                        is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
+                        v = is_nan.select(f_nan, v)
+                        v = (col >= loc0).select(f_local, v)
+                        v = (col < i32_init).select(f_init, v)
+                        ords.append((col < vb).select(_f32_to_ord(v), int_min))
+                    else:
+                        ords.append(_f32_to_ord(v))
                     cols.append(col)
                 return ords, cols
 
             # seed: 16 wave-argmax rounds over chunk 0, chunks 1..PF in flight meanwhile
-            ords, cols = unpack(load_raw(fx.Int32(0)), fx.Int32(0))
+            ords, cols = unpack(load_raw(fx.Int32(0)), fx.Int32(0), True)
             ring = [load_raw(fx.Int32(1 + i)) for i in range(PF_CHUNKS)]
             list_ord = int_min
             list_idx = fx.Int32(-1)
@@ -159,14 +166,8 @@ def compile_topk_prefill():
                     taken = hit.select(fx.Int32(1), taken)
             thr = fx.Int32(_rocdl.readlane(T.i32, list_ord, 15))
 
-            # remaining chunks: insert the values above the threshold
-            n_chunks = (vb + (CHUNK - 1)) // CHUNK
-            for civ, st in range(
-                fx.Index(1),
-                fx.Index(n_chunks),
-                fx.Index(1),
-                init=[x.ir_value() for x in (list_ord, list_idx, thr, *ring)],
-            ):
+            def scan(civ, st, full):
+                """one chunk: consume ring[0], refill the ring, insert the hits"""
                 list_ord = fx.Int32(st[0])
                 list_idx = fx.Int32(st[1])
                 thr = fx.Int32(st[2])
@@ -174,7 +175,7 @@ def compile_topk_prefill():
                 cur = ring[0]
                 # loads past the row's chunks land in the masked tail / the next row
                 ring = ring[1:] + [load_raw(fx.Int32(civ) + PF_CHUNKS)]
-                ords, cols = unpack(cur, fx.Int32(civ))
+                ords, cols = unpack(cur, fx.Int32(civ), full)
                 # candidates above the threshold, one value at a time (a hit lane
                 # rarely has more than one): insert at the count of list entries
                 # >= it, shift the rest down one lane, re-read the threshold
@@ -209,7 +210,26 @@ def compile_topk_prefill():
                     list_ord = fx.Int32(res2[0])
                     list_idx = fx.Int32(res2[1])
                     thr = fx.Int32(res2[2])
-                res = yield [x.ir_value() for x in (list_ord, list_idx, thr, *ring)]
+                return [x.ir_value() for x in (list_ord, list_idx, thr, *ring)]
+
+            # remaining chunks: the middle ones with the cheap unpack, the last one
+            # (it holds the local block and the visible-block bound) with the full one
+            n_chunks = (vb + (CHUNK - 1)) // CHUNK
+            n_last = (n_chunks > 1).select(n_chunks - 1, fx.Int32(1))
+            for civ, st in range(
+                fx.Index(1),
+                fx.Index(n_last),
+                fx.Index(1),
+                init=[x.ir_value() for x in (list_ord, list_idx, thr, *ring)],
+            ):
+                res = yield scan(civ, st, False)
+            for civ, st in range(
+                fx.Index(n_last),
+                fx.Index(n_chunks),
+                fx.Index(1),
+                init=list(res),
+            ):
+                res = yield scan(civ, st, True)
             list_idx = fx.Int32(res[1])
             out = _global_i32_ptr(arg_out)
             if lane < TOPK:
