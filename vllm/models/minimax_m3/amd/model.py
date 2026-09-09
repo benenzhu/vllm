@@ -458,6 +458,37 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
+        # FlyDSL decode MoE (gfx950, <= 256 tokens): MXFP4 weights ->
+        # ops/moe_a16w4_decode, MXFP8 (ModelOpt on AITER_MXFP8) -> ops/moe_a8w8_decode.
+        # Calls outside the gate (larger batches, unfused shared experts) stay on
+        # the aiter path.
+        if envs.VLLM_ROCM_USE_M3_FLYDSL_DECODE_MOE:
+            from vllm.models.minimax_m3.amd.ops.moe_a8w8_decode import (
+                is_mxfp8_aiter_layer,
+            )
+
+            if is_mxfp8_aiter_layer(
+                getattr(self.experts, "routed_experts", self.experts)
+            ):
+                from vllm.models.minimax_m3.amd.ops.moe_a8w8_decode import (
+                    install_decode_fast_path,
+                )
+            else:
+                from vllm.models.minimax_m3.amd.ops.moe_a16w4_decode import (
+                    install_decode_fast_path,
+                )
+
+            install_decode_fast_path(self.experts, prefix=f"{prefix}.experts")
+        # FlyDSL a4w4 prefill MoE (gfx950, MXFP4 W4A4, 3072..32768 tokens); see
+        # vllm/models/minimax_m3/amd/ops/moe_a4w4_prefill. Wraps on top of the
+        # decode fast path; other calls stay on the aiter path.
+        if envs.VLLM_ROCM_USE_M3_FLYDSL_PREFILL_MOE:
+            from vllm.models.minimax_m3.amd.ops.moe_a4w4_prefill import (
+                install_prefill_fast_path,
+            )
+
+            install_prefill_fast_path(self.experts, prefix=f"{prefix}.experts")
+
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()

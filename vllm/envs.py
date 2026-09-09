@@ -139,6 +139,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: bool = False
+    VLLM_ROCM_USE_M3_FLYDSL_DECODE_MOE: bool = False
+    VLLM_ROCM_USE_M3_FLYDSL_PREFILL_MOE: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
@@ -1285,6 +1287,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate_mode to AITER and sets the AITER-side workaround env at init.
     "VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "0").lower() in ("true", "1")
+    ),
+    # MiniMax-M3 MXFP4 (W4A16) on gfx950: run decode MoE calls (<= 16 tokens)
+    # on the sort-free FlyDSL kernels under
+    # vllm/models/minimax_m3/amd/ops/moe_a16w4_decode instead of the aiter CK
+    # chain. Larger batches and unsupported layer configs keep the aiter path.
+    "VLLM_ROCM_USE_M3_FLYDSL_DECODE_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_M3_FLYDSL_DECODE_MOE", "0").lower() in ("true", "1")
+    ),
+    # MiniMax-M3 MXFP4 (W4A4) on gfx950: run prefill MoE calls (3072..32768
+    # tokens) on the FlyDSL a4w4 chain under
+    # vllm/models/minimax_m3/amd/ops/moe_a4w4_prefill instead of aiter's
+    # fused_moe. Other batch sizes and unsupported layer configs keep the
+    # aiter path.
+    "VLLM_ROCM_USE_M3_FLYDSL_PREFILL_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_M3_FLYDSL_PREFILL_MOE", "0").lower() in ("true", "1")
     ),
     # MoE sorting dispatch policy for AITER fused MoE kernels.
     #   0 = auto (default): single-pass for small batches, multi-pass
