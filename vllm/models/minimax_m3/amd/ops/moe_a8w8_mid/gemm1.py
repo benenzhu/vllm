@@ -98,7 +98,8 @@ def _pin_accumulators(values):
 def compile_moe_gemm1_mid(*, H: int, I: int, E: int, BM: int):  # noqa: E741
     """Grouped fp8 gemm1 for one (H, I, E, BM); ``BM`` (32 / 64 / 128) is the sort
     block of the inputs. Grid: ``num_m_blocks * launch.n_tiles`` workgroups of
-    256 threads, workgroup ``(mb, nb)`` = ``divmod(bx, n_tiles)``; blocks at or
+    256 threads, workgroup ``(mb0, nb)`` = ``divmod(bx, n_tiles)`` with the
+    last expert's blocks (``num_valid_ids[1]`` on) mapped first; blocks at or
     past ``num_valid_ids[0]`` exit at once."""
     assert BM in (32, 64, 128), BM
     # A batch (K-steps per LDS slot, 2 slots) and W prefetch depth per block size:
@@ -170,14 +171,31 @@ def compile_moe_gemm1_mid(*, H: int, I: int, E: int, BM: int):  # noqa: E741
         for i in range(bx * per_wg + tx * 4, bx * per_wg + per_wg, 256 * 4):
             buffer_ops.buffer_store(zero4, zero_rsrc, fx.Int32(i))
         nv_rsrc = buffer_ops.create_buffer_resource(
-            num_valid_ids, max_size=False, num_records_bytes=4
+            num_valid_ids, max_size=False, num_records_bytes=8
         )
         valid_rows = fx.Int32(
             buffer_ops.buffer_load(
                 nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
-        mb, nb = bx // N_TILES, bx % N_TILES
+        last_start = fx.Int32(
+            buffer_ops.buffer_load(
+                nv_rsrc, fx.Int32(1), vec_width=1, dtype=fx.Int32, is_scalar=True
+            )
+        )
+        # block order: the last expert's blocks first (the fused shared expert,
+        # M / BM blocks re-reading one W13 slice per tile: dispatched together
+        # L2 / MALL serve the re-reads; as the grid's tail they ran latency-bound
+        # -> gemm1 -8 us at 512..2048 tokens), then the routed blocks, then the
+        # blocks past num_valid_ids[0], which exit
+        valid_blocks = valid_rows // BM
+        last_blocks = valid_blocks - last_start // BM
+        mb0, nb = bx // N_TILES, bx % N_TILES
+        mb = mb0 - last_blocks
+        if mb < 0:
+            mb = mb + valid_blocks
+        if mb0 >= valid_blocks:
+            mb = mb0
         if mb * BM < valid_rows:
             eid_rsrc = buffer_ops.create_buffer_resource(
                 sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4

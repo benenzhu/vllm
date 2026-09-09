@@ -13,8 +13,11 @@ argument. Three launches per call:
                                   rows, places its pairs (LDS atomic on its
                                   per-expert cursor) and pads its share of
                                   experts; CTA 0 also writes
-                                  ``sorted_expert_ids`` per block and
-                                  ``num_valid_ids[0]`` = padded total
+                                  ``sorted_expert_ids`` per block,
+                                  ``num_valid_ids[0]`` = padded total and
+                                  ``num_valid_ids[1]`` = the last expert's
+                                  first row (the mid chain's fused shared
+                                  expert: its blocks go first in the GEMMs)
 
 Outputs are aiter's layout: ``sorted_ids[row] = token | slot << 24`` (padding
 rows: ``n_tokens``), ``sorted_weights`` (padding 0), ``sorted_expert_ids`` per
@@ -47,7 +50,7 @@ def max_sorted_rows(n_tokens: int, E: int, topk: int, block_m: int) -> int:
 class SortBuffers:
     sorted_ids: torch.Tensor
     sorted_expert_ids: torch.Tensor
-    num_valid_ids: torch.Tensor  # [2] i32, [0] = padded row count
+    num_valid_ids: torch.Tensor  # [2] i32: padded row count, the last expert's first row
     sorted_weights: torch.Tensor
     block_offsets: torch.Tensor  # workspace [E * SORT_CTAS]: per-CTA counts
     max_sorted: int
@@ -204,6 +207,7 @@ def compile_moe_sort(*, E: int, topk: int, block_m: int):
         if bx == 0:
             if tx == 0:
                 num_valid[0] = fx.Int32(starts[E])
+                num_valid[1] = fx.Int32(starts[E - 1])  # the last expert's first row
             if tx < E:
                 for b in range(
                     fx.Int32(starts[tx]) >> bm_shift, fx.Int32(starts[tx + 1]) >> bm_shift
