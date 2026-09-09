@@ -73,7 +73,7 @@ from vllm.models.minimax_m3.amd.ops.moe_a8w8_prefill.gemm1 import (
 )
 
 TN = 64  # output columns per workgroup (64: a 0.79 MB W13 slice; 128: the prefill tile's)
-PREFETCH = 3  # W K-steps in flight per wave
+PREFETCH = 3  # W K-steps in flight per wave (128-row blocks: 2)
 W_CACHE_MOD = 2  # non-temporal W loads: no W reuse below 3072 tokens
 BLOCK_K = 128  # K per step (128 B per row, one fp8 MFMA)
 LDS_PAD = 16  # bytes of padding per staged A row: conflict-free 16 B reads
@@ -101,7 +101,11 @@ def compile_moe_gemm1_mid(*, H: int, I: int, E: int, BM: int):  # noqa: E741
     256 threads, workgroup ``(mb, nb)`` = ``divmod(bx, n_tiles)``; blocks at or
     past ``num_valid_ids[0]`` exit at once."""
     assert BM in (32, 64, 128), BM
-    KB = 4 if BM <= 64 else 2  # K-steps per A batch (2 LDS slots: 33 / 66 / 68 KB)
+    # A batch (K-steps per LDS slot, 2 slots) and W prefetch depth per block size:
+    # 128-row blocks go to 1-step batches and a 2-deep ring to fit 2 waves per
+    # SIMD (280 -> 232 registers, LDS 70 -> 38 KB; 2048 tokens: chain -2%, 3 x A/B)
+    KB = {32: 4, 64: 4, 128: 1}[BM]
+    PF = {32: PREFETCH, 64: PREFETCH, 128: 2}[BM]
     KT = H // BLOCK_K
     NI = TN // 4 // 16  # 16-col tiles per wave, of gate and of up each
     MR = BM // 16  # 16-row tiles
@@ -129,7 +133,7 @@ def compile_moe_gemm1_mid(*, H: int, I: int, E: int, BM: int):  # noqa: E741
         amax: fx.Array[fx.Float32, 4 * MR * 16]  # NI 1: per-wave, per-row 16-col amax
 
     @flyc.kernel(
-        name=f"m3_gemm1_a8w8_mid_h{H}_i{I}_e{E}_bm{BM}_tn{TN}_kb{KB}_pf{PREFETCH}",
+        name=f"m3_gemm1_a8w8_mid_h{H}_i{I}_e{E}_bm{BM}_tn{TN}_kb{KB}_pf{PF}",
         known_block_size=[256, 1, 1],
     )
     def kernel_gemm1(
@@ -320,14 +324,14 @@ def compile_moe_gemm1_mid(*, H: int, I: int, E: int, BM: int):  # noqa: E741
             mfma = Mfma16x16x128Fp8(MR, NI)
             acc = [[[None] * 2 for _ in range(NI)] for _ in range(MR)]
             abuf = load_a_batch(0)
-            ring = [load_b_step(kt) for kt in range_constexpr(PREFETCH)]
+            ring = [load_b_step(kt) for kt in range_constexpr(PF)]
             stage_a_batch(abuf, 0)
             sa = sb = None
             for kt in range_constexpr(KT):
                 if const_expr(kt % KB == 0 and kt + KB < KT):
                     abuf = load_a_batch(kt // KB + 1)  # before this step's W loads
-                if const_expr(kt + PREFETCH < KT):
-                    ring.append(load_b_step(kt + PREFETCH))
+                if const_expr(kt + PF < KT):
+                    ring.append(load_b_step(kt + PF))
                 bb, sc = ring.pop(0)
                 if const_expr(kt % 2 == 0):
                     sa, sb = sc
