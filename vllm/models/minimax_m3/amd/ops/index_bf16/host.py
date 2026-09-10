@@ -96,6 +96,7 @@ def index_score_prefill(
         int(total_q),
         int(kv_bytes),
         int(batch),
+        int(((batch - 1) * block_table.stride(0) + block_table.shape[1]) * 4),
         int(_cdiv(qt * nseg * batch, 8) * 8),
         torch.cuda.current_stream(),
     )

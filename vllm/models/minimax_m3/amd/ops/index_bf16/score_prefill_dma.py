@@ -14,10 +14,9 @@ per-block math. What changes is how a K block reaches LDS:
 * rows are XOR-swizzled instead of padded (DMA writes 1 KB contiguous): the 16 B
   column ``c`` of row ``r`` sits at ``c ^ (r & 15)``, so the 16 rows of an MFMA
   A fragment hit 16 different bank groups.
-* page ids are fetched with ``s_load_dword`` (lgkmcnt, not vmcnt) one block
-  ahead, so the compiler's own waitcnt insertion never drains the DMA queue; the
-  result is routed through the wait (``_pin_lgkm``), or the compiler schedules the
-  descriptor arithmetic before it.
+* page ids come from a scalar buffer load (``s_buffer_load``: SMEM, lgkmcnt) one
+  block ahead. A vector load would sit in vmcnt, and the compiler's wait for it
+  (it cannot see the asm DMA) would drain the DMA queue in the middle of a block.
 * two accumulator sets and a pinned per-M-tile schedule (sched_group_barrier:
   2 MFMA : 1 VALU, next A fragments early): the previous tile's max3 run under
   this tile's MFMAs instead of stalling on fresh accumulators.
@@ -74,27 +73,6 @@ def _asm_void(operands, asm, constraints, clobbers=""):
     llvm.inline_asm(None, [_ir(o) for o in operands], asm, constraints, has_side_effects=True)
 
 
-def _s_load_dword(addr_i64):
-    """``s_load_dword`` at a wave-uniform 64-bit address: SGPR result, counted by
-    lgkmcnt (the DMA loads sit in vmcnt; a vector load here would make the
-    compiler drain vmcnt before the first use)."""
-    return fx.Int32(
-        llvm.inline_asm(
-            T.i32, [_ir(fx.Int64(addr_i64))], "s_load_dword $0, $1, 0x0", "=s,s", has_side_effects=True
-        )
-    )
-
-
-def _pin_lgkm(v):
-    """``v`` after ``s_waitcnt lgkmcnt(0)``, as the asm's output: the compiler treats
-    an inline-asm ``s_load`` result as ready at once and schedules its consumers
-    (the descriptor arithmetic) before a free-standing wait; tying the value to
-    the wait makes them depend on it."""
-    return fx.Int32(
-        llvm.inline_asm(T.i32, [_ir(fx.Int32(v))], "s_waitcnt lgkmcnt(0)", "=s,0", has_side_effects=True)
-    )
-
-
 def compile_score_prefill_dma():
     """One kernel for every shape (all sizes are runtime arguments)."""
     name = f"m3_index_score_prefill_bf16_dma_tq{TILE_Q}_nw{NW}" + "".join(
@@ -121,6 +99,7 @@ def compile_score_prefill_dma():
         i32_total_q: fx.Int32,
         i64_kv_bytes: fx.Int64,
         i32_nb: fx.Int32,
+        i64_bt_bytes: fx.Int64,  # block table storage size (rows may be padded)
     ):
         k_afpf = AFPF
         smem = fx.SharedAllocator().allocate(Shared).peek()
@@ -212,10 +191,16 @@ def compile_score_prefill_dma():
                 bt_row = b * i32_bt_stride
                 last_blk = nblk - 1
 
+                btr = buffer_ops.create_buffer_resource_from_addr(arg_bt, num_records_bytes=i64_bt_bytes)
+
                 def page_of(blk):
-                    """page id of block ``blk`` (past the end: the last block), SGPR"""
+                    """page id of block ``blk`` (past the end: the last block): a scalar
+                    buffer load (SMEM, lgkmcnt) the compiler schedules and waits for; a
+                    vector load here would sit in vmcnt and its wait would drain the DMA"""
                     bi = (blk < nblk).select(blk, last_blk)
-                    return _s_load_dword(arg_bt + fx.Int64(bt_row + bi) * 4)
+                    return fx.Int32(
+                        buffer_ops.buffer_load(btr, bt_row + bi, vec_width=1, dtype=fx.Int32, is_scalar=True)
+                    )
 
                 def dma_block(page, slot):
                     """issue the wave's 8 DMA loads of block ``page`` into ``slot``"""
@@ -361,7 +346,7 @@ def compile_score_prefill_dma():
                 # (the DMA issued during block blk0) loaded; wait for all of them once
                 pgs = [page_of(blk0 + i) for i in range_constexpr(PF)]
                 for i in range_constexpr(PF):
-                    dma_block(_pin_lgkm(pgs[i]), i % N_SLOTS)
+                    dma_block(pgs[i], i % N_SLOTS)
                 pg_next = page_of(blk0 + PF)
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                 fx.gpu.barrier()
@@ -373,7 +358,7 @@ def compile_score_prefill_dma():
                     sc = []
                     for j in range_constexpr(GROUP):
                         blk = g0 + j
-                        dma_block(_pin_lgkm(pg_next), (j + PF) % N_SLOTS)  # page loaded a block ago
+                        dma_block(pg_next, (j + PF) % N_SLOTS)  # page loaded a block ago
                         pg_next = page_of(blk + PF + 1)
                         sc.append(compute_block(j % N_SLOTS, blk, masked))
                         block_done()
@@ -406,6 +391,7 @@ def compile_score_prefill_dma():
         i32_total_q: fx.Int32,
         i64_kv_bytes: fx.Int64,
         i32_nb: fx.Int32,
+        i64_bt_bytes: fx.Int64,
         i32_grid: fx.Int32,
         stream: fx.Stream,
     ):
@@ -424,6 +410,7 @@ def compile_score_prefill_dma():
             i32_total_q,
             i64_kv_bytes,
             i32_nb,
+            i64_bt_bytes,
         ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
     launch.kernel_name = name
