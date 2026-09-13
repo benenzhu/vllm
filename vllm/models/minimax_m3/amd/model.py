@@ -1032,10 +1032,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_cache = self.indexer.index_cache.kv_cache
         if index_cache.numel() == 0 or not index_cache.is_contiguous():
             return False
-        # The fused kernel writes bf16 index keys / index_q; with an fp8 index
-        # cache (indexer_kv_dtype=fp8) keep the separate fp8-emitting kernels.
-        if index_cache.dtype != torch.bfloat16 or index_q_out.dtype != torch.bfloat16:
+        # The fused kernel writes the index keys / index_q in the index cache's
+        # dtype (bf16, or e4m3 for the AITER fp8 score path); index_q must match.
+        if index_q_out.dtype != index_cache.dtype:
             return False
+        index_cache_is_fp8 = index_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         index_cache_arg = index_cache
 
         key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
@@ -1115,9 +1116,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_q_out,
             index_slot_mapping,
             kv_cache_dtype=self.kv_cache_dtype if is_fp8 else "auto",
-            # vLLM's index score/topk kernels read a bf16 index cache; keep it
-            # that way instead of following the KV cache to fp8.
-            index_cache_dtype="auto",
+            # Follow the index cache's own dtype (bf16 for the Triton / FlyDSL
+            # bf16 path, fp8 for the AITER / FlyDSL fp8 path) rather than the
+            # KV cache dtype, which is what the aiter wrapper would default to.
+            index_cache_dtype="fp8" if index_cache_is_fp8 else "auto",
             k_scale=k_scale,
             v_scale=v_scale,
             asm_layout=True,
