@@ -514,6 +514,36 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
+def _o_proj_skinny(attn: nn.Module, attn_output: torch.Tensor) -> torch.Tensor | None:
+    """``attn.o_proj`` through the FlyDSL skinny GEMM
+    (VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM) for batches of at most 128 tokens; None
+    when hipBLASLt should run. The first call compiles the kernels and shuffles the
+    weight (outside CUDA-graph capture: the profile run comes first)."""
+    if not attn._o_proj_skinny_checked:
+        attn._o_proj_skinny_checked = True
+        w = getattr(attn.o_proj, "weight", None)
+        if (
+            envs.VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM
+            and w is not None
+            and w.dtype == torch.bfloat16
+            and w.dim() == 2
+        ):
+            from .ops import gemm_a16w16
+
+            if gemm_a16w16.supports(*w.shape):
+                gemm_a16w16.warmup(w.shape[0], w.shape[1], w.device)
+                attn._o_proj_shuffled = gemm_a16w16.shuffle_weight(w.data)
+    if attn._o_proj_shuffled is None:
+        return None
+    from .ops import gemm_a16w16
+
+    N, K = attn.o_proj.weight.shape
+    x = attn_output.reshape(-1, K)
+    if x.shape[0] > gemm_a16w16.MAX_TOKENS:
+        return None
+    return gemm_a16w16.skinny_gemm(x.contiguous(), attn._o_proj_shuffled, N, K)
+
+
 class MiniMaxM3Attention(nn.Module):
     """Dense attention with per-head QK norm and partial RoPE."""
 
@@ -563,6 +593,10 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM: the preshuffled o_proj weight for the
+        # FlyDSL skinny GEMM (decode-sized batches), built at the first forward
+        self._o_proj_shuffled: torch.Tensor | None = None
+        self._o_proj_skinny_checked = False
 
         # Per-head QK norm (qk_norm_type == "per_head", use_gemma_norm == True).
         self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -606,7 +640,9 @@ class MiniMaxM3Attention(nn.Module):
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        output = _o_proj_skinny(self, attn_output)
+        if output is None:
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -692,6 +728,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM: the preshuffled o_proj weight for the
+        # FlyDSL skinny GEMM (decode-sized batches), built at the first forward
+        self._o_proj_shuffled: torch.Tensor | None = None
+        self._o_proj_skinny_checked = False
 
         # Per-head QK norm (qk_norm_type == "per_head", use_gemma_norm == True).
         self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -1104,7 +1144,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, index_q, output)
-        output, _ = self.o_proj(attn_output)
+        output = _o_proj_skinny(self, attn_output)
+        if output is None:
+            output, _ = self.o_proj(attn_output)
         return output
 
     @eager_break_during_capture

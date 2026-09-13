@@ -78,6 +78,28 @@ def get_skinny(**kw):
     return _launches.setdefault(launch.kernel_name, launch)
 
 
+def supports(N: int, K: int) -> bool:
+    """Whether the shape's tile divides it (4 K-steps per A batch, KS x KW K ranges)."""
+    tn, kw, _pf, ks = tile_for(0, N, K)
+    return N % tn == 0 and K % (ks * kw * 4 * TILE_K) == 0 and N * K * 2 <= 0xFFFFFFFF
+
+
+_warmed: set[tuple] = set()
+
+
+def warmup(N: int, K: int, device) -> None:
+    """Compile every row-tile variant and allocate the K-split scratch once, outside
+    CUDA-graph capture (the first call of a variant compiles and allocates)."""
+    key = (N, K, str(device))
+    if key in _warmed:
+        return
+    _warmed.add(key)
+    w_sh = shuffle_weight(torch.zeros(N, K, dtype=torch.bfloat16, device=device))
+    for rt in range(1, MAX_RT + 1):
+        skinny_gemm(torch.zeros(rt * 16, K, dtype=torch.bfloat16, device=device), w_sh, N, K)
+    torch.cuda.synchronize()
+
+
 def skinny_gemm(x: torch.Tensor, w_shuffled: torch.Tensor, N: int, K: int, out: torch.Tensor | None = None):
     """``x[M, K] bf16 @ w[N, K]^T`` -> bf16 ``[M, N]`` for M <= 128 (fp32 accumulation).
     ``w_shuffled`` is ``shuffle_weight(w)``."""
