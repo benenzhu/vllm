@@ -98,6 +98,8 @@ DECODE_CASES = [
         2,
     ),  # two 64-request groups
 ]
+# the four-waves-per-row top-k: several chunks per wave, a wave with none
+DECODE_TOPK_CASES = DECODE_CASES[:3] + [([600000, 350000, 1500], 4)]
 
 
 @pytest.mark.parametrize("seq_lens,qlen", DECODE_CASES)
@@ -189,7 +191,7 @@ def test_prefill_topk_matches_aiter(q_lens, ctxs):
     _check_topk(score, ref, out)
 
 
-@pytest.mark.parametrize("seq_lens,qlen", DECODE_CASES[:3])
+@pytest.mark.parametrize("seq_lens,qlen", DECODE_TOPK_CASES)
 def test_decode_topk_matches_aiter(seq_lens, qlen):
     cache, bt, seq, q, score, _ = _inputs(
         [qlen] * len(seq_lens), [s - qlen for s in seq_lens], seed=qlen + 5

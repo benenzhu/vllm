@@ -17,7 +17,10 @@ in an SGPR. Scores are compared as order-preserving int32. Chunk 0 (blocks
 0..255, 4 per lane) seeds the list with 16 wave-argmax rounds; every later
 256-block chunk is loaded 16 B per lane, and only the values above the
 threshold (about 16 * ln(blocks / 16) per row over the whole scan) are inserted,
-one at a time, with a 16-lane shift. Memory-bound: one read of the score row.
+one at a time, with a 16-lane shift. Memory-bound with thousands of rows (one
+read of the score row); with the few rows of a decode step one wave per row is
+bound by its own instruction stream, so uniform rows go to ``topk_split``
+(four waves per row) instead.
 
 The table: the selected blocks' pages packed towards slot 0 in score order,
 full blocks first and the row's own (partial) block last, zeros after, one row

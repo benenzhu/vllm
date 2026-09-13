@@ -10,6 +10,7 @@ import torch
 from . import score_decode as _score_decode
 from . import score_prefill as _score_prefill
 from . import topk as _topk
+from . import topk_split as _topk_split
 from .utils import _run_compiled
 
 SPARSE_BLOCK_SIZE = 128
@@ -160,6 +161,11 @@ def get_topk():
     return _topk.compile_topk()
 
 
+@functools.cache
+def get_topk_split():
+    return _topk_split.compile_topk_split()
+
+
 def topk(
     score: torch.Tensor,  # [1, total_q, S] fp32
     topk_idx: torch.Tensor,  # [1, total_q, 16] i32, in place (may be a row slice)
@@ -180,8 +186,9 @@ def topk(
     """Drop-in for AITER's ``pa_sparse_block_topk`` (one local head, topk 16,
     8 pages per block): the 16 best blocks of every row (-1 padded) and the
     attend's page table + token count per (row, kv head). Ragged rows come with
-    ``num_valid_pages`` / ``row_req_id`` / ``kv_lens``; uniform rows use
-    ``query_len`` and ``seq_lens``."""
+    ``num_valid_pages`` / ``row_req_id`` / ``kv_lens`` (prefill: one wave per
+    row); uniform rows use ``query_len`` and ``seq_lens`` (decode: four waves
+    per row)."""
     num_idx_heads, total_q, S = score.shape
     assert num_idx_heads == 1 and score.dtype == torch.float32 and score.stride(2) == 1
     assert score.stride(1) == S
@@ -225,6 +232,27 @@ def topk(
         assert seq_lens.numel() == total_q // query_len
         qlen, rid, kvl, rows_bytes = query_len, 0, 0, 0
     if total_q == 0:
+        return
+    if num_valid_pages is None:
+        # uniform rows (decode): few rows, four waves per row
+        _run_compiled(
+            get_topk_split(),
+            score.data_ptr(),
+            topk_idx.data_ptr(),
+            block_table.data_ptr(),
+            seq_lens.data_ptr(),
+            sparse_bt.data_ptr(),
+            sparse_ctx.data_ptr(),
+            int(seq_lens.numel() * 4),
+            int(S),
+            int(total_q),
+            int(qlen),
+            int(topk_idx.stride(1)),
+            int(block_table.stride(0)),
+            int(sparse_bt.stride(0)),
+            int(num_kv_heads),
+            torch.cuda.current_stream(),
+        )
         return
     _run_compiled(
         get_topk(),
