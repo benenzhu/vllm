@@ -80,16 +80,20 @@ def compile_score_decode_v3():
         seq = _global_i32_ptr(arg_seq)
         bt = _global_i32_ptr(arg_bt)
 
-        # work split, one lane per request
+        # work split, one lane per request: request i gets floor(nb_i * (WAVES -
+        # nreq) / total) waves, at least one, so the sum never exceeds WAVES
+        # (rounding up per request could overflow the budget by nreq - 1 waves
+        # and leave the last requests' tails unscored); its waves then split its
+        # blocks evenly
         has = lane < i32_nreq
         L_l = fx.Int32(seq[has.select(lane, fx.Int32(0))])
         L_l = (has & (L_l > 0)).select(L_l, fx.Int32(0))
         nb_l = (L_l + (BLK - 1)) // BLK
         incl_nb = _wave_prefix_sum_i32(nb_l, lane)
         total_blocks = fx.Int32(fx.rocdl.readlane(T.i32, incl_nb, 63))
-        bpw = (total_blocks + (WAVES - 1)) // WAVES
-        bpw = (bpw > 0).select(bpw, fx.Int32(1))
-        nw_l = (nb_l + bpw - 1) // bpw
+        total_blocks = (total_blocks > 0).select(total_blocks, fx.Int32(1))
+        nw_l = (nb_l * (WAVES - i32_nreq)) // total_blocks
+        nw_l = ((nb_l > 0) & (nw_l < 1)).select(fx.Int32(1), nw_l)
         incl_nw = _wave_prefix_sum_i32(nw_l, lane)
         off_l = incl_nw - nw_l
         owns = has & (wid >= off_l) & (wid < off_l + nw_l)
@@ -99,8 +103,10 @@ def compile_score_decode_v3():
         r_ok = (own_mask != 0).select(r, fx.Int32(0))
         my_w = wid - fx.Int32(fx.rocdl.readlane(T.i32, off_l, r_ok))
         nb = fx.Int32(fx.rocdl.readlane(T.i32, nb_l, r_ok))
+        nw = fx.Int32(fx.rocdl.readlane(T.i32, nw_l, r_ok))
         L = fx.Int32(fx.rocdl.readlane(T.i32, L_l, r_ok))
         if r >= 0:
+            bpw = (nb + nw - 1) // nw
             blk0 = my_w * bpw
             blk1e = blk0 + bpw
             blk1 = (blk1e < nb).select(blk1e, nb)
