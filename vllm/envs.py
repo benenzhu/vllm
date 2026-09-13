@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: bool = False
+    VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
@@ -1278,6 +1279,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #       see PR #39177 for benchmarks)
     "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": lambda: int(
         os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")
+    ),
+    # MiniMax-M3 on ROCm: run the decode-sized (<= 128 tokens) bf16 o_proj GEMM
+    # with the FlyDSL skinny GEMM under vllm/models/minimax_m3/amd/ops/gemm_a16w16
+    # instead of hipBLASLt (keeps a preshuffled copy of the weight).
+    "VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_M3_FLYDSL_SKINNY_GEMM", "0").lower() in ("true", "1")
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
