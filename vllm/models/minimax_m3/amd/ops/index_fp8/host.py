@@ -7,6 +7,7 @@ import functools
 
 import torch
 
+from . import score_decode as _score_decode
 from . import score_prefill as _score_prefill
 from . import topk as _topk
 from .utils import _run_compiled
@@ -86,6 +87,60 @@ def score_prefill(
         int(_cdiv(qt * nseg * batch, 8) * 8),
         torch.cuda.current_stream(),
     )
+
+
+@functools.cache
+def get_score_decode():
+    return _score_decode.compile_score_decode()
+
+
+def score_decode(
+    q_idx: torch.Tensor,  # [num_reqs * query_len, 1, 128] e4m3
+    key_cache_idx: torch.Tensor,  # [num_blocks, 128, 128] e4m3
+    score: torch.Tensor,  # [1, num_reqs * query_len, S] fp32, written in place
+    block_table: torch.Tensor,  # [num_reqs, >= max_block] i32
+    seq_lens: torch.Tensor,  # [num_reqs] i32
+    init_blocks: int = 0,
+    local_blocks: int = 0,
+    query_len: int = 1,
+    max_seq_len: int = 0,
+) -> None:
+    """Drop-in for AITER's ``pa_sparse_block_score_decode`` (one local index
+    head, uniform query length ≤ 16). The kernel's work split is one lane per
+    request, so requests are scored in groups of 64 (one launch each)."""
+    total_q, num_idx_heads, head_dim = q_idx.shape
+    num_reqs = seq_lens.shape[0]
+    assert num_idx_heads == 1 and head_dim == 128 and total_q == num_reqs * query_len
+    assert 1 <= query_len <= 16
+    assert q_idx.dtype in FP8_DTYPES and key_cache_idx.dtype == q_idx.dtype
+    assert q_idx.is_contiguous() and key_cache_idx.is_contiguous()
+    assert tuple(key_cache_idx.shape[1:]) == (SPARSE_BLOCK_SIZE, head_dim)
+    assert score.dtype == torch.float32 and score.stride(2) == 1
+    assert score.shape[0] == 1 and score.shape[1] == total_q and score.stride(1) == score.shape[2]
+    assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
+    assert seq_lens.dtype == torch.int32 and seq_lens.stride(0) == 1
+    if num_reqs == 0:
+        return
+    S = score.shape[2]
+    assert S >= _cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    for r0 in range(0, num_reqs, _score_decode.MAX_REQS):
+        n = min(_score_decode.MAX_REQS, num_reqs - r0)
+        _run_compiled(
+            get_score_decode(),
+            q_idx.data_ptr() + r0 * query_len * q_idx.stride(0) * q_idx.element_size(),
+            key_cache_idx.data_ptr(),
+            score.data_ptr() + r0 * query_len * score.stride(1) * 4,
+            block_table.data_ptr() + r0 * block_table.stride(0) * 4,
+            seq_lens.data_ptr() + r0 * 4,
+            int(block_table.stride(0)),
+            int(S),
+            int(n),
+            int(query_len),
+            int(init_blocks),
+            int(local_blocks),
+            int(n * query_len),
+            torch.cuda.current_stream(),
+        )
 
 
 @functools.cache
