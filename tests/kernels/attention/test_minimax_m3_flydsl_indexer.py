@@ -209,3 +209,102 @@ def test_decode_topk_matches_aiter(seq_lens, qlen):
         score, bt, seq, len(seq_lens) * qlen, max(seq_lens), dict(query_len=qlen)
     )
     _check_topk(score, ref, out)
+
+
+# ---------------------------------------------------------------------------
+# bf16 index cache: the FlyDSL drop-ins of the Triton wrappers in amd/ops/index_topk
+# ---------------------------------------------------------------------------
+index_bf16 = pytest.importorskip("vllm.models.minimax_m3.amd.ops.index_bf16")
+
+
+def _bf16_inputs(q_lens, ctxs, seed):
+    g = torch.Generator(device=DEV)
+    g.manual_seed(seed)
+    seq_lens = [c + q for c, q in zip(ctxs, q_lens)]
+    nblocks = [-(-s // BLK) for s in seq_lens]
+    pool = sum(nblocks) + 8
+    cache = (torch.randn(pool, BLK, D, device=DEV, generator=g) * 0.1).to(
+        torch.bfloat16
+    )
+    bt = torch.zeros(len(q_lens), max(nblocks), dtype=torch.int32, device=DEV)
+    perm = torch.randperm(pool, device=DEV, generator=g).to(torch.int32)
+    o = 0
+    for i, n in enumerate(nblocks):
+        bt[i, :n] = perm[o : o + n]
+        o += n
+    q = (torch.randn(sum(q_lens), 1, D, device=DEV, generator=g) * 0.1).to(
+        torch.bfloat16
+    )
+    return cache, bt, q, _i32(seq_lens), _i32(ctxs), seq_lens
+
+
+@pytest.mark.parametrize("q_lens,ctxs", PREFILL_CASES)
+def test_bf16_prefill_matches_triton(q_lens, ctxs):
+    from vllm.models.minimax_m3.amd.ops import index_topk as tri
+
+    cache, bt, q, seq, prefix, seq_lens = _bf16_inputs(q_lens, ctxs, seed=len(ctxs) + 3)
+    cu = _i32([0] + list(torch.cumsum(torch.tensor(q_lens), 0)))
+    args = (q, cache, bt, cu, seq, prefix, max(q_lens), max(seq_lens), 1)
+    # the Triton kernels through the wrappers with the FlyDSL dispatch off
+    tri._flydsl_bf16.cache_clear()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tri.envs, "VLLM_ROCM_USE_M3_FLYDSL_INDEXER", False)
+        ref = tri.minimax_m3_index_score(*args)
+        tk_ref = tri.minimax_m3_index_topk(ref, cu, prefix, max(q_lens), TOPK, 0, 1)
+    tri._flydsl_bf16.cache_clear()
+    out = index_bf16.index_score_prefill(*args)
+    tk_out = index_bf16.index_topk_prefill(out, cu, prefix, max(q_lens), TOPK, 0, 1)
+    torch.cuda.synchronize()
+    for b, (ql, c) in enumerate(zip(q_lens, ctxs)):
+        r0 = int(cu[b])
+        for r in range(ql):
+            n = (c + r) // BLK + 1
+            torch.testing.assert_close(
+                out[0, r0 + r, :n], ref[0, r0 + r, :n], rtol=0, atol=1e-5
+            )
+    # the same block set per row (ties in the fp32 sum order may reorder)
+    for r in range(sum(q_lens)):
+        assert set(tk_out[0, r].tolist()) == set(tk_ref[0, r].tolist()), r
+
+
+@pytest.mark.parametrize("seq_lens,qlen", DECODE_CASES)
+def test_bf16_decode_matches_triton(seq_lens, qlen):
+    from vllm.models.minimax_m3.amd.ops import index_topk as tri
+    from vllm.models.minimax_m3.amd.ops.sparse_pa import PAGES_PER_SPARSE_BLOCK
+
+    cache, bt, q, seq, _, _ = _bf16_inputs(
+        [qlen] * len(seq_lens), [s - qlen for s in seq_lens], seed=qlen + 9
+    )
+    total_q = q.shape[0]
+    args = (q, cache, bt, seq, max(seq_lens), TOPK, 0, 1, 1, qlen, qlen)
+
+    def run(fn):
+        out = torch.empty(1, total_q, TOPK, dtype=torch.int32, device=DEV)
+        sbt = torch.empty(
+            total_q, TOPK * PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=DEV
+        )
+        sctx = torch.empty(total_q, dtype=torch.int32, device=DEV)
+        cnt = torch.zeros(1, total_q, dtype=torch.int32, device=DEV)
+        fn(
+            *args,
+            out=out,
+            attention_block_table=bt,
+            sparse_block_table_out=sbt,
+            sparse_context_lens_out=sctx,
+            block_page_stride=PAGES_PER_SPARSE_BLOCK,
+            completion_counter=cnt,
+        )
+        torch.cuda.synchronize()
+        return out, sbt, sctx
+
+    tri._flydsl_bf16.cache_clear()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tri.envs, "VLLM_ROCM_USE_M3_FLYDSL_INDEXER", False)
+        o_ref, s_ref, c_ref = run(tri.minimax_m3_index_decode)
+    tri._flydsl_bf16.cache_clear()
+    o_out, s_out, c_out = run(index_bf16.index_decode)
+    for r in range(total_q):
+        assert set(o_out[0, r].tolist()) == set(o_ref[0, r].tolist()), r
+    assert torch.equal(c_ref, c_out)
+    same = ~(o_ref != o_out).any(dim=-1)[0]
+    assert torch.equal(s_ref[same], s_out[same])

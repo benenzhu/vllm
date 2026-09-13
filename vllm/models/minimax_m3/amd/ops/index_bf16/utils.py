@@ -94,11 +94,17 @@ def _wave_prefix_sum_i32(val, lane):
     ``_dpp_intra_wave_prefix_sum``)."""
     zero_raw = fx.as_ir_value(fx.Int32(0))
     for shift, ctrl in _DPP_ROW_SHR:
-        remote = _rocdl.update_dpp(_T.i32, zero_raw, fx.as_ir_value(val), ctrl, 0xF, 0xF, True)
+        remote = _rocdl.update_dpp(
+            _T.i32, zero_raw, fx.as_ir_value(val), ctrl, 0xF, 0xF, True
+        )
         val = (lane >= shift).select(val + fx.Int32(remote), val)
     src16 = (lane & 0x30) - 1
-    r16 = fx.Int32(_rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src16 * 4), fx.as_ir_value(val)))
+    r16 = fx.Int32(
+        _rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src16 * 4), fx.as_ir_value(val))
+    )
     val = (lane >= 16).select(val + r16, val)
     src32 = (lane & 0x30) - 17
-    r32 = fx.Int32(_rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src32 * 4), fx.as_ir_value(val)))
+    r32 = fx.Int32(
+        _rocdl.ds_bpermute(_T.i32, fx.as_ir_value(src32 * 4), fx.as_ir_value(val))
+    )
     return (lane >= 32).select(val + r32, val)

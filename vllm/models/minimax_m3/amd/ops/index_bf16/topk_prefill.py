@@ -18,8 +18,6 @@ scan) are inserted, one at a time, with a 16-lane shift. Equal scores keep the
 lower block id first. Memory-bound: one read of the score row.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -35,7 +33,7 @@ BLK = 128
 CHUNK = 256  # blocks per chunk: 4 per lane, one dwordx4
 # chunks loaded ahead of the one being scanned (the scan of a row is a chain of
 # dependent 1 KB loads otherwise: ~20 round trips at 650K context)
-PF_CHUNKS = int(os.environ.get("M3_IDX_TOPK_PF", "2"))
+PF_CHUNKS = 2
 INT32_MIN = -(1 << 31)
 # DPP controls (16-lane rows): row_ror:n = 0x120 + n, row_shr:n = 0x110 + n
 _ROW_ROR = (0x121, 0x122, 0x124, 0x128)
@@ -112,7 +110,10 @@ def compile_topk_prefill():
             def load_raw(c):
                 return fx.Vector(
                     buffer_ops.buffer_load(
-                        sr, row_base + c * CHUNK + lane * 4, vec_width=4, dtype=fx.Float32
+                        sr,
+                        row_base + c * CHUNK + lane * 4,
+                        vec_width=4,
+                        dtype=fx.Float32,
                     )
                 )
 
@@ -206,7 +207,9 @@ def compile_topk_prefill():
                         list_ord = (lane == p).select(oj, below.select(sh_o, list_ord))
                         list_idx = (lane == p).select(ij, below.select(sh_i, list_idx))
                         thr = fx.Int32(_rocdl.readlane(T.i32, list_ord, 15))
-                        res2 = yield [x.ir_value() for x in (list_ord, list_idx, thr, mask)]
+                        res2 = yield [
+                            x.ir_value() for x in (list_ord, list_idx, thr, mask)
+                        ]
                     list_ord = fx.Int32(res2[0])
                     list_idx = fx.Int32(res2[1])
                     thr = fx.Int32(res2[2])
@@ -250,8 +253,15 @@ def compile_topk_prefill():
         stream: fx.Stream,
     ):
         kernel(
-            arg_score, arg_out, arg_cu, arg_prefix, i32_S, i32_qbs, i32_total_q,
-            i32_init, i32_local,
+            arg_score,
+            arg_out,
+            arg_cu,
+            arg_prefix,
+            i32_S,
+            i32_qbs,
+            i32_total_q,
+            i32_init,
+            i32_local,
         ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
     launch.kernel_name = name

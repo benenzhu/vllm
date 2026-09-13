@@ -7,6 +7,16 @@
 tensor layout is unchanged so ``minimax_m3_index_topk`` consumes it as is.
 """
 
-from .host import index_decode, index_score_decode, index_score_prefill, index_topk_prefill
+from .host import (
+    index_decode,
+    index_score_decode,
+    index_score_prefill,
+    index_topk_prefill,
+)
 
-__all__ = ["index_decode", "index_score_decode", "index_score_prefill", "index_topk_prefill"]
+__all__ = [
+    "index_decode",
+    "index_score_decode",
+    "index_score_prefill",
+    "index_topk_prefill",
+]

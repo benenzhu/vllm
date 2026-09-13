@@ -16,8 +16,12 @@ head selects its own block ids for the block-sparse attention kernels in
 ``sparse_attn``.
 """
 
+from functools import cache
+
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     PAGES_PER_SPARSE_BLOCK,
     _write_sparse_block_table_row_from_values,
@@ -26,8 +30,39 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
+logger = init_logger(__name__)
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+
+
+@cache
+def _flydsl_bf16(num_idx_heads: int):
+    """The FlyDSL drop-ins of the three wrappers below (``ops/index_bf16``) when
+    they apply -- one index head per rank, gfx950, the switch
+    VLLM_ROCM_USE_M3_FLYDSL_INDEXER on, the package importable -- else None
+    (the Triton kernels)."""
+    if not envs.VLLM_ROCM_USE_M3_FLYDSL_INDEXER or num_idx_heads != 1:
+        return None
+    from vllm.platforms.rocm import on_gfx950
+
+    if not current_platform.is_rocm() or not on_gfx950():
+        return None
+    try:
+        from vllm.models.minimax_m3.amd.ops import index_bf16
+    except ImportError as exc:
+        logger.warning_once(
+            "MiniMax M3 indexer: FlyDSL bf16 score/top-k kernels unavailable (%s); "
+            "using the Triton kernels",
+            exc,
+        )
+        return None
+    logger.info_once(
+        "MiniMax M3 indexer: FlyDSL bf16 score/top-k kernels (ops/index_bf16)"
+    )
+    return index_bf16
+
+
 DECODE_SCORE_BALANCED_PROGRAM_BUDGET = 1024
 DECODE_SCORE_HIGH_BATCH_PROGRAM_BUDGET = 768
 MAX_DECODE_SCORE_BALANCED_REQUESTS = 11
@@ -1185,6 +1220,19 @@ def minimax_m3_index_score(
     assert num_idx_heads == num_kv_heads, (
         "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     )
+    fly = _flydsl_bf16(num_idx_heads)
+    if fly is not None and idx_q.dtype == index_kv_cache.dtype == torch.bfloat16:
+        return fly.index_score_prefill(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            num_kv_heads,
+        )
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -1241,6 +1289,18 @@ def minimax_m3_index_topk(
     used to keep the top-k output at a stable address for cudagraph capture.
     """
     num_idx_heads = score.shape[0]
+    fly = _flydsl_bf16(num_idx_heads)
+    if fly is not None and topk == 16 and score.stride(1) == score.shape[2]:
+        return fly.index_topk_prefill(
+            score,
+            cu_seqlens_q,
+            prefix_lens,
+            max_query_len,
+            topk,
+            init_blocks,
+            local_blocks,
+            out=out,
+        )
     batch = cu_seqlens_q.shape[0] - 1
     total_q = score.shape[1]
     if out is not None:
@@ -1308,6 +1368,31 @@ def minimax_m3_index_decode(
     be zero before its first launch and must not be shared by overlapping
     selector invocations; every completed launch resets its active entries.
     """
+    fly = _flydsl_bf16(idx_q.shape[1])
+    if (
+        fly is not None
+        and idx_q.dtype == index_kv_cache.dtype == torch.bfloat16
+        and decode_query_len <= 16
+    ):
+        return fly.index_decode(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            topk,
+            init_blocks,
+            local_blocks,
+            num_kv_heads,
+            decode_query_len,
+            max_decode_query_len,
+            out=out,
+            attention_block_table=attention_block_table,
+            sparse_block_table_out=sparse_block_table_out,
+            sparse_context_lens_out=sparse_context_lens_out,
+            block_page_stride=block_page_stride,
+            completion_counter=completion_counter,
+        )
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads, (
         "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
