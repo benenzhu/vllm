@@ -52,7 +52,11 @@ def score_prefill(
     assert q_idx.is_contiguous() and key_cache_idx.is_contiguous()
     assert tuple(key_cache_idx.shape[1:]) == (SPARSE_BLOCK_SIZE, head_dim)
     assert score.dtype == torch.float32 and score.stride(2) == 1
-    assert score.shape[0] == 1 and score.shape[1] == total_q and score.stride(1) == score.shape[2]
+    assert (
+        score.shape[0] == 1
+        and score.shape[1] == total_q
+        and score.stride(1) == score.shape[2]
+    )
     for t in (block_table, cu_seqlens_q, seq_lens):
         assert t.dtype == torch.int32 and t.stride(-1) == 1
     assert max_query_len >= 1 and max_seq_len >= 1
@@ -61,11 +65,15 @@ def score_prefill(
         return
     S = score.shape[2]
     max_block = _cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
-    assert S >= max_block
+    assert max_block <= S
     qt = _cdiv(max_query_len, _score_prefill.TILE_Q)
     nseg = max(
         1,
-        min(MAX_SEGMENTS, TARGET_WORKGROUPS // max(1, qt * batch), max_block // _score_prefill.GROUP),
+        min(
+            MAX_SEGMENTS,
+            TARGET_WORKGROUPS // max(1, qt * batch),
+            max_block // _score_prefill.GROUP,
+        ),
     )
     _run_compiled(
         get_score_prefill(),
@@ -116,13 +124,17 @@ def score_decode(
     assert q_idx.is_contiguous() and key_cache_idx.is_contiguous()
     assert tuple(key_cache_idx.shape[1:]) == (SPARSE_BLOCK_SIZE, head_dim)
     assert score.dtype == torch.float32 and score.stride(2) == 1
-    assert score.shape[0] == 1 and score.shape[1] == total_q and score.stride(1) == score.shape[2]
+    assert (
+        score.shape[0] == 1
+        and score.shape[1] == total_q
+        and score.stride(1) == score.shape[2]
+    )
     assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
     assert seq_lens.dtype == torch.int32 and seq_lens.stride(0) == 1
     if num_reqs == 0:
         return
     S = score.shape[2]
-    assert S >= _cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    assert _cdiv(max_seq_len, SPARSE_BLOCK_SIZE) <= S
     for r0 in range(0, num_reqs, _score_decode.MAX_REQS):
         n = min(_score_decode.MAX_REQS, num_reqs - r0)
         _run_compiled(
@@ -150,8 +162,8 @@ def get_topk():
 
 def topk(
     score: torch.Tensor,  # [1, total_q, S] fp32
-    topk_idx: torch.Tensor,  # [1, total_q, 16] i32, written in place (may be a row slice)
-    block_table: torch.Tensor,  # the attend's (page-16) block table [num_reqs, stride] i32
+    topk_idx: torch.Tensor,  # [1, total_q, 16] i32, in place (may be a row slice)
+    block_table: torch.Tensor,  # the attend's page-16 block table [num_reqs, stride]
     seq_lens: torch.Tensor,  # [num_reqs] i32 (uniform rows)
     sparse_bt: torch.Tensor,  # [total_q * num_kv_heads, 16 * 8] i32, written in place
     sparse_ctx: torch.Tensor,  # [total_q * num_kv_heads] i32, written in place
@@ -173,20 +185,40 @@ def topk(
     num_idx_heads, total_q, S = score.shape
     assert num_idx_heads == 1 and score.dtype == torch.float32 and score.stride(2) == 1
     assert score.stride(1) == S
-    assert topk_idx.dtype == torch.int32 and topk_idx.shape[0] == 1 and topk_idx.shape[1] == total_q
+    assert (
+        topk_idx.dtype == torch.int32
+        and topk_idx.shape[0] == 1
+        and topk_idx.shape[1] == total_q
+    )
     assert topk_idx.shape[2] == _topk.TOPK and topk_idx.stride(2) == 1
     assert block_size == _topk.BLK and pages_per_block == _topk.PPB
     assert num_kv_heads >= 1
     rows = total_q * num_kv_heads
-    assert sparse_bt.dtype == torch.int32 and sparse_bt.shape == (rows, _topk.TOPK * _topk.PPB)
-    assert sparse_bt.stride(1) == 1 and sparse_ctx.dtype == torch.int32 and sparse_ctx.numel() == rows
-    assert sparse_ctx.stride(0) == 1 and block_table.dtype == torch.int32 and block_table.stride(1) == 1
-    assert S >= _cdiv(max_seq_len, block_size)
+    assert sparse_bt.dtype == torch.int32 and sparse_bt.shape == (
+        rows,
+        _topk.TOPK * _topk.PPB,
+    )
+    assert (
+        sparse_bt.stride(1) == 1
+        and sparse_ctx.dtype == torch.int32
+        and sparse_ctx.numel() == rows
+    )
+    assert (
+        sparse_ctx.stride(0) == 1
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    )
+    assert _cdiv(max_seq_len, block_size) <= S
     if num_valid_pages is not None:
         assert row_req_id is not None and kv_lens is not None
         for t in (row_req_id, kv_lens):
             assert t.dtype == torch.int32 and t.numel() == total_q and t.stride(0) == 1
-        qlen, rid, kvl, rows_bytes = 0, row_req_id.data_ptr(), kv_lens.data_ptr(), total_q * 4
+        qlen, rid, kvl, rows_bytes = (
+            0,
+            row_req_id.data_ptr(),
+            kv_lens.data_ptr(),
+            total_q * 4,
+        )
     else:
         assert query_len >= 1 and total_q % query_len == 0
         assert seq_lens.dtype == torch.int32 and seq_lens.stride(0) == 1

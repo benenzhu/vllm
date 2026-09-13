@@ -34,7 +34,13 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from .utils import _global_i32_ptr, _maxf_nn, _mfma_fp8_16x16x128, _pack8, _xlane_max4_pair
+from .utils import (
+    _global_i32_ptr,
+    _maxf_nn,
+    _mfma_fp8_16x16x128,
+    _pack8,
+    _xlane_max4_pair,
+)
 
 NW = 4  # waves per workgroup
 ROWS_PER_WAVE = 128  # 8 MFMA N-tiles of query rows
@@ -51,7 +57,9 @@ LDS_BYTES = N_SLOTS * BLOCK_BYTES  # 32 KB
 GROUP = 4  # blocks buffered per score store (16 B per row)
 NI = ROWS_PER_WAVE // 16  # N-tiles (query rows) per wave
 MT = BLK // 16  # M-tiles (tokens) per block
-DMA_PER_WAVE = BLOCK_BYTES // (NW * 64 * 16)  # 4 x 1 KB DMA instructions per wave per block
+DMA_PER_WAVE = BLOCK_BYTES // (
+    NW * 64 * 16
+)  # 4 x 1 KB DMA instructions per wave per block
 SENTINEL_INIT = 1e30  # AITER's forced-selection scores (its top-k orders by them)
 SENTINEL_LOCAL = 1e29
 
@@ -65,7 +73,9 @@ def _asm_void(operands, asm, constraints, clobbers=""):
     waitcnt for it: the DMA completion wait is explicit)."""
     if clobbers:
         constraints = f"{constraints},{clobbers}"
-    llvm.inline_asm(None, [_ir(o) for o in operands], asm, constraints, has_side_effects=True)
+    llvm.inline_asm(
+        None, [_ir(o) for o in operands], asm, constraints, has_side_effects=True
+    )
 
 
 def compile_score_prefill():
@@ -130,8 +140,9 @@ def compile_score_prefill():
                     num_records_bytes=fx.Int64(i32_total_q) * fx.Int64(i32_S) * 4,
                 )
 
-                # this wave's query rows (request-local): row0 + wave*128 + ni*16 + l16;
-                # rows past q_len read the next request's rows and are masked at store
+                # this wave's query rows (request-local): row0 + wave*128 + ni*16 +
+                # l16; rows past q_len read the next request's rows and are masked
+                # at store
                 rows = [row0 + wave * ROWS_PER_WAVE + ni * 16 + l16 for ni in range(NI)]
                 qpos = [prefix + r for r in rows]  # absolute query positions
                 # Q^T B operands: lane (l16, q16) holds dims [16*q16, +16) and
@@ -142,7 +153,10 @@ def compile_score_prefill():
                     halves = [
                         fx.Vector(
                             buffer_ops.buffer_load(
-                                qr, (qrow + h * 64 + q16 * 16) // 4, vec_width=4, dtype=fx.Int32
+                                qr,
+                                (qrow + h * 64 + q16 * 16) // 4,
+                                vec_width=4,
+                                dtype=fx.Int32,
                             )
                         )
                         for h in range_constexpr(2)
@@ -164,8 +178,9 @@ def compile_score_prefill():
                     fx.copy(lds_atom, fx.slice(lds16, (None, tile)), r)
                     return r.load()
 
-                # DMA: instruction jj of wave w fills LDS bytes (w*4 + jj) * 1 KB .. +1 KB
-                # of the slot = rows r = (w*4 + jj)*8 + lane//8, 16 B column lane%8.
+                # DMA: instruction jj of wave w fills LDS bytes (w*4 + jj) * 1 KB ..
+                # +1 KB of the slot = rows r = (w*4 + jj)*8 + lane//8, 16 B column
+                # lane%8.
                 # Column c of row r holds the block's column c ^ ((r >> 1) & 7), and
                 # (r >> 1) & 7 = ((jj & 1) << 2) | lane//16 for these rows.
                 lds_base_s = fx.Int32(
@@ -183,27 +198,40 @@ def compile_score_prefill():
                 bt_row = b * i32_bt_stride
                 last_blk = nblk - 1
 
-                btr = buffer_ops.create_buffer_resource_from_addr(arg_bt, num_records_bytes=i64_bt_bytes)
+                btr = buffer_ops.create_buffer_resource_from_addr(
+                    arg_bt, num_records_bytes=i64_bt_bytes
+                )
 
                 def page_of(blk):
                     """page id of block ``blk`` (past the end: the last block): a scalar
                     buffer load (SMEM, lgkmcnt) the compiler schedules and waits for; a
-                    vector load here would sit in vmcnt and its wait would drain the DMA"""
+                    vector load here would sit in vmcnt and its wait would drain the
+                    DMA"""
                     bi = (blk < nblk).select(blk, last_blk)
                     return fx.Int32(
-                        buffer_ops.buffer_load(btr, bt_row + bi, vec_width=1, dtype=fx.Int32, is_scalar=True)
+                        buffer_ops.buffer_load(
+                            btr,
+                            bt_row + bi,
+                            vec_width=1,
+                            dtype=fx.Int32,
+                            is_scalar=True,
+                        )
                     )
 
                 def dma_block(page, slot):
                     """issue the wave's 4 DMA loads of block ``page`` into ``slot``"""
                     kr = buffer_ops.create_buffer_resource_from_addr(
-                        arg_kv + fx.Int64(page) * BLOCK_BYTES, num_records_bytes=BLOCK_BYTES
+                        arg_kv + fx.Int64(page) * BLOCK_BYTES,
+                        num_records_bytes=BLOCK_BYTES,
                     )
                     for jj in range_constexpr(DMA_PER_WAVE):
-                        m0 = lds_base_s + (slot * BLOCK_BYTES + (wave * DMA_PER_WAVE + jj) * 1024)
+                        m0 = lds_base_s + (
+                            slot * BLOCK_BYTES + (wave * DMA_PER_WAVE + jj) * 1024
+                        )
                         _asm_void(
                             [m0, dma_voff[jj], kr, soff0],
-                            "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds",
+                            "s_mov_b32 m0, $0\n"
+                            "buffer_load_dwordx4 $1, $2, $3 offen lds",
                             "s,v,s,s",
                         )
 
@@ -226,14 +254,20 @@ def compile_score_prefill():
                     apply the causal select; False for blocks every row of the tile
                     sees whole."""
                     if const_expr(masked):
-                        vis = [qpos[ni] - (blk * BLK + q16 * 4) for ni in range_constexpr(NI)]
+                        vis = [
+                            qpos[ni] - (blk * BLK + q16 * 4)
+                            for ni in range_constexpr(NI)
+                        ]
                     run = [neg_inf for _ in range(NI)]
 
                     def read_a(mt):
                         base = slot * SLOT_T + mt * 16 * RS_T + rd_row
-                        return _pack8(lds_load16(base + rd_col[0]), lds_load16(base + rd_col[1]))
+                        return _pack8(
+                            lds_load16(base + rd_col[0]), lds_load16(base + rd_col[1])
+                        )
 
-                    # two accumulator sets: the max of M-tile mt-1 runs under the MFMAs of
+                    # two accumulator sets: the max of M-tile mt-1 runs under the MFMAs
+                    # of
                     # M-tile mt
                     accs = [[None] * NI, [None] * NI]
 
@@ -260,15 +294,18 @@ def compile_score_prefill():
                         issue(mt, a)
                         if const_expr(mt >= 1):
                             reduce(mt - 1)
-                        # pin this tile's schedule: one MFMA then the previous tile's share
-                        # of max (plus the causal selects when masked), the next tile's A
-                        # operand reads under the first MFMAs. Left to itself the scheduler
-                        # consumes accumulators right behind their MFMAs (it frees
-                        # registers) and pays the MFMA -> VALU hazard every tile.
+                        # pin this tile's schedule: one MFMA then the previous tile's
+                        # share of max (plus the causal selects when masked), the next
+                        # tile's A operand reads under the first MFMAs. Left to itself
+                        # the scheduler consumes accumulators right behind their MFMAs
+                        # (it frees registers) and pays the MFMA -> VALU hazard every
+                        # tile.
                         n_valu = 16 if not masked else 48
                         for i in range_constexpr(NI):
                             fx.rocdl.sched_group_barrier(0x008, 1, 0)
-                            fx.rocdl.sched_group_barrier(0x002, (n_valu + NI - 1) // NI, 0)
+                            fx.rocdl.sched_group_barrier(
+                                0x002, (n_valu + NI - 1) // NI, 0
+                            )
                             if const_expr(i < 2):
                                 fx.rocdl.sched_group_barrier(0x100, 1, 0)
                         fx.rocdl.sched_barrier(0)
@@ -298,12 +335,16 @@ def compile_score_prefill():
                                 for j in range_constexpr(GROUP)
                             ]
                         valid = row < q_len
-                        nb_row = (prefix + row) // BLK + 1  # the row's causal block count
+                        nb_row = (
+                            prefix + row
+                        ) // BLK + 1  # the row's causal block count
                         for j in range_constexpr(GROUP):
                             blk = g0 + j
                             is_local = (blk >= nb_row - i32_local) & (blk < nb_row)
                             is_init = blk < i32_init
-                            vals[j] = is_local.select(sent_local, is_init.select(sent_init, vals[j]))
+                            vals[j] = is_local.select(
+                                sent_local, is_init.select(sent_init, vals[j])
+                            )
                         off = (seq_start + row) * i32_S + g0
                         if full:
                             buffer_ops.buffer_store(
@@ -343,7 +384,9 @@ def compile_score_prefill():
                     sc = []
                     for j in range_constexpr(GROUP):
                         blk = g0 + j
-                        dma_block(pg_next, (j + PF) % N_SLOTS)  # page loaded a block ago
+                        dma_block(
+                            pg_next, (j + PF) % N_SLOTS
+                        )  # page loaded a block ago
                         pg_next = page_of(blk + PF + 1)
                         sc.append(compute_block(j % N_SLOTS, blk, masked))
                         block_done()
@@ -353,10 +396,17 @@ def compile_score_prefill():
                 def one(st):
                     return fx.Int32(st[0] if isinstance(st, (list, tuple)) else st)
 
-                for g, st in range(fx.Index(0), fx.Index(n_full), fx.Index(1), init=[_ir(pg_next)]):
+                for g, st in range(
+                    fx.Index(0), fx.Index(n_full), fx.Index(1), init=[_ir(pg_next)]
+                ):
                     pg_next = group(blk0 + fx.Int32(g) * GROUP, one(st), False)
                     res = yield [_ir(pg_next)]
-                for g, st in range(fx.Index(n_full), fx.Index(n_groups), fx.Index(1), init=[_ir(one(res))]):
+                for g, st in range(
+                    fx.Index(n_full),
+                    fx.Index(n_groups),
+                    fx.Index(1),
+                    init=[_ir(one(res))],
+                ):
                     pg_next = group(blk0 + fx.Int32(g) * GROUP, one(st), True)
                     res = yield [_ir(pg_next)]
 

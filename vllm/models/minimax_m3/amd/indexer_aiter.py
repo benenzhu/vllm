@@ -21,6 +21,12 @@ QK-norm/RoPE kernel emits both directly when the index cache is e4m3. See
 ``aiter_indexer_unsupported_reason`` for the full set of limits;
 ``select_aiter_indexer_impl_cls`` refuses to pick this impl unless they all
 hold, and the model falls back to the platform-neutral ``MiniMaxM3Indexer``.
+
+With one index head per rank the three kernels are the FlyDSL drop-ins under
+``ops/index_fp8`` (the same score buffer, sentinels and emitted table; the
+prefill scorer runs the 16x16x128 fp8 MFMA against a DMA-staged K block and
+the top-k is a per-row threshold insertion), selected by default and switched
+back to AITER's with ``VLLM_ROCM_USE_M3_FLYDSL_INDEXER=0``.
 """
 
 import math
@@ -31,6 +37,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.forward_context import get_forward_context
@@ -122,6 +129,50 @@ def aiter_msa_kernels_unavailable_reason() -> str | None:
     except ImportError as exc:
         return f"AITER cannot supply the MSA score/top-k kernels ({exc})"
     return None
+
+
+@cache
+def select_score_topk_kernels(num_index_heads: int) -> tuple:
+    """The ``(score_decode, score_prefill, topk)`` kernels of the fp8 indexer:
+    the FlyDSL drop-ins (``ops/index_fp8``) when they apply -- one index head
+    per rank, the switch on, the package importable -- otherwise AITER's."""
+    from aiter.ops.msa_attention import (
+        pa_sparse_block_score_decode,
+        pa_sparse_block_score_prefill,
+        pa_sparse_block_topk,
+    )
+
+    aiter_kernels = (
+        pa_sparse_block_score_decode,
+        pa_sparse_block_score_prefill,
+        pa_sparse_block_topk,
+    )
+    if not envs.VLLM_ROCM_USE_M3_FLYDSL_INDEXER:
+        logger.info_once(
+            "MiniMax M3 indexer: AITER score/top-k kernels "
+            "(VLLM_ROCM_USE_M3_FLYDSL_INDEXER=0)"
+        )
+        return aiter_kernels
+    if num_index_heads != 1:
+        logger.info_once(
+            "MiniMax M3 indexer: the FlyDSL score/top-k kernels take one index "
+            "head per rank, got %d; using AITER's",
+            num_index_heads,
+        )
+        return aiter_kernels
+    try:
+        from vllm.models.minimax_m3.amd.ops import index_fp8
+    except ImportError as exc:
+        logger.warning_once(
+            "MiniMax M3 indexer: FlyDSL score/top-k kernels unavailable (%s); "
+            "using AITER's",
+            exc,
+        )
+        return aiter_kernels
+    logger.info_once(
+        "MiniMax M3 indexer: FlyDSL fp8 score/top-k kernels (ops/index_fp8)"
+    )
+    return (index_fp8.score_decode, index_fp8.score_prefill, index_fp8.topk)
 
 
 def aiter_indexer_unsupported_reason(
@@ -437,11 +488,11 @@ class MiniMaxM3IndexerAiterImpl(MiniMaxM3IndexerImpl):
         decode_page16_block_table: torch.Tensor | None = None,
         prefill_page16_block_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        from aiter.ops.msa_attention import (
+        (
             pa_sparse_block_score_decode,
             pa_sparse_block_score_prefill,
             pa_sparse_block_topk,
-        )
+        ) = select_score_topk_kernels(self.num_index_heads)
 
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):

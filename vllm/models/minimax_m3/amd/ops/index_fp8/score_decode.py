@@ -33,7 +33,8 @@ from .utils import (
 )
 
 NW = 4
-WAVES = 1024  # graph-constant wave budget (measured best for bf16: 4-5 blocks per wave at 800K conc 1)
+# graph-constant wave budget (bf16 measured best: 4-5 blocks per wave, 800K, conc 1)
+WAVES = 1024
 BLK = 128
 D = 128
 ROW_BYTES = D
@@ -126,7 +127,10 @@ def compile_score_decode():
             qh = [
                 fx.Vector(
                     buffer_ops.buffer_load(
-                        qr, (row * ROW_BYTES + h * 64 + q16 * 16) // 4, vec_width=4, dtype=fx.Int32
+                        qr,
+                        (row * ROW_BYTES + h * 64 + q16 * 16) // 4,
+                        vec_width=4,
+                        dtype=fx.Int32,
                     )
                 )
                 for h in range_constexpr(2)
@@ -143,12 +147,15 @@ def compile_score_decode():
 
             def page_of(blk):
                 bi = (blk < nb).select(blk, last_blk)
-                return fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(bt[bt_row + bi])))
+                return fx.Int32(
+                    fx.rocdl.readfirstlane(T.i32, fx.Int32(bt[bt_row + bi]))
+                )
 
             # LDS: this wave's RING piece slots, 16 B tiles
             lds16 = fx.logical_divide(
                 fx.make_view(
-                    fx.recast_iter(fx.Int32, smem.a.ptr), fx.make_layout(LDS_BYTES // 4, 1)
+                    fx.recast_iter(fx.Int32, smem.a.ptr),
+                    fx.make_layout(LDS_BYTES // 4, 1),
                 ),
                 fx.make_layout(4, 1),
             )
@@ -169,7 +176,8 @@ def compile_score_decode():
             # lane (row 8i + lane//8, 16 B chunk lane%8); page and piece in soffset
             row_off = ((lane // 8) * ROW_BYTES + (lane % 8) * 16) // 4
             st_tiles = [
-                (8 * i + lane // 8) * RS_T + lane % 8 for i in range_constexpr(PIECE_LOADS)
+                (8 * i + lane // 8) * RS_T + lane % 8
+                for i in range_constexpr(PIECE_LOADS)
             ]
 
             def load_piece(page, p):
@@ -217,24 +225,34 @@ def compile_score_decode():
                 sc = (visible & (blk >= loc0)).select(f_local, sc)
                 sc = (visible & (blk < i32_init)).select(f_init, sc)
                 ok = (l16 < i32_qlen) & (q16 == 0) & (blk < blk1)
-                buffer_ops.buffer_store(sc, sr, (r * i32_qlen + l16) * i32_S + blk, mask=ok)
+                buffer_ops.buffer_store(
+                    sc, sr, (r * i32_qlen + l16) * i32_S + blk, mask=ok
+                )
 
             # two blocks per iteration; carried: pages of the two blocks, the two
             # pieces in flight (pieces 0, 1 of the iteration's first block)
             n_it = (blk1 - blk0 + 1) // 2
             p0 = page_of(blk0)
             p1 = page_of(blk0 + 1)
-            assert RING <= PIECES  # the carried pieces belong to the iteration's first block
+            assert (
+                RING <= PIECES
+            )  # the carried pieces belong to the iteration's first block
             ring_init = []
             for k in range_constexpr(RING):
                 ring_init += load_piece(p0, k)
             init = [p0, p1] + ring_init
             for iv, st in range(
-                fx.Index(0), fx.Index(n_it), fx.Index(1), init=[x.ir_value() for x in init]
+                fx.Index(0),
+                fx.Index(n_it),
+                fx.Index(1),
+                init=[x.ir_value() for x in init],
             ):
                 pg = [fx.Int32(st[0]), fx.Int32(st[1])]
                 ring = [
-                    [fx.Vector(st[2 + k * PIECE_LOADS + i]) for i in range_constexpr(PIECE_LOADS)]
+                    [
+                        fx.Vector(st[2 + k * PIECE_LOADS + i])
+                        for i in range_constexpr(PIECE_LOADS)
+                    ]
                     for k in range_constexpr(RING)
                 ]
                 blk = blk0 + fx.Int32(iv) * 2
@@ -245,7 +263,9 @@ def compile_score_decode():
                     if kk < 2 * PIECES:
                         ring.append(load_piece(pg[kk // PIECES], kk % PIECES))
                     else:
-                        ring.append(load_piece(nxt[0], kk - 2 * PIECES))  # next iteration's
+                        ring.append(
+                            load_piece(nxt[0], kk - 2 * PIECES)
+                        )  # next iteration's
                     regs = ring.pop(0)
                     slot = k % RING
                     stage_piece(regs, slot)
@@ -257,7 +277,7 @@ def compile_score_decode():
                 carried = [nxt[0], nxt[1]]
                 for k in range_constexpr(RING):
                     carried += ring[k]
-                res = yield [x.ir_value() for x in carried]
+                yield [x.ir_value() for x in carried]
 
     @flyc.jit
     def launch(
@@ -276,8 +296,18 @@ def compile_score_decode():
         stream: fx.Stream,
     ):
         kernel(
-            arg_q, arg_kv, arg_score, arg_bt, arg_seq, i32_bt_stride, i32_S, i32_nreq,
-            i32_qlen, i32_init, i32_local, i32_total_q,
+            arg_q,
+            arg_kv,
+            arg_score,
+            arg_bt,
+            arg_seq,
+            i32_bt_stride,
+            i32_S,
+            i32_nreq,
+            i32_qlen,
+            i32_init,
+            i32_local,
+            i32_total_q,
         ).launch(grid=(WAVES // NW, 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
     launch.kernel_name = name

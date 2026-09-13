@@ -114,13 +114,23 @@ def compile_topk():
             # of the shape not in use are out of their zero-length buffers: 0)
             ragged = i32_qlen == 0
             qlen1 = ragged.select(fx.Int32(1), i32_qlen)
-            rr = buffer_ops.create_buffer_resource_from_addr(arg_rid, num_records_bytes=i64_rows_bytes)
-            kr = buffer_ops.create_buffer_resource_from_addr(arg_kvl, num_records_bytes=i64_rows_bytes)
-            sres = buffer_ops.create_buffer_resource_from_addr(arg_seq, num_records_bytes=i64_seq_bytes)
+            rr = buffer_ops.create_buffer_resource_from_addr(
+                arg_rid, num_records_bytes=i64_rows_bytes
+            )
+            kr = buffer_ops.create_buffer_resource_from_addr(
+                arg_kvl, num_records_bytes=i64_rows_bytes
+            )
+            sres = buffer_ops.create_buffer_resource_from_addr(
+                arg_seq, num_records_bytes=i64_seq_bytes
+            )
             req_r = fx.Int32(buffer_ops.buffer_load(rr, n, vec_width=1, dtype=fx.Int32))
-            causal_r = fx.Int32(buffer_ops.buffer_load(kr, n, vec_width=1, dtype=fx.Int32))
+            causal_r = fx.Int32(
+                buffer_ops.buffer_load(kr, n, vec_width=1, dtype=fx.Int32)
+            )
             req_u = n // qlen1
-            seq_u = fx.Int32(buffer_ops.buffer_load(sres, req_u, vec_width=1, dtype=fx.Int32))
+            seq_u = fx.Int32(
+                buffer_ops.buffer_load(sres, req_u, vec_width=1, dtype=fx.Int32)
+            )
             causal_u = seq_u - qlen1 + (n - req_u * qlen1) + 1
             req = ragged.select(req_r, req_u)
             causal = ragged.select(causal_r, causal_u)
@@ -136,7 +146,10 @@ def compile_topk():
             def load_raw(c):
                 return fx.Vector(
                     buffer_ops.buffer_load(
-                        sr, row_base + c * CHUNK + lane * 4, vec_width=4, dtype=fx.Float32
+                        sr,
+                        row_base + c * CHUNK + lane * 4,
+                        vec_width=4,
+                        dtype=fx.Float32,
                     )
                 )
 
@@ -160,7 +173,7 @@ def compile_topk():
                     cols.append(col)
                 return ords, cols
 
-            # seed: 16 wave-argmax rounds over chunk 0, chunks 1..PF in flight meanwhile.
+            # seed: 16 wave-argmax rounds over chunk 0, chunks 1..PF in flight.
             # Ties go to the higher block id (AITER's key order).
             ords, cols = unpack(load_raw(fx.Int32(0)), fx.Int32(0), True)
             ring = [load_raw(fx.Int32(1 + i)) for i in range(PF_CHUNKS)]
@@ -230,7 +243,9 @@ def compile_topk():
                         list_ord = (lane == p).select(oj, below.select(sh_o, list_ord))
                         list_idx = (lane == p).select(ij, below.select(sh_i, list_idx))
                         thr = fx.Int32(_rocdl.readlane(T.i32, list_ord, 15))
-                        res2 = yield [x.ir_value() for x in (list_ord, list_idx, thr, mask)]
+                        res2 = yield [
+                            x.ir_value() for x in (list_ord, list_idx, thr, mask)
+                        ]
                     list_ord = fx.Int32(res2[0])
                     list_idx = fx.Int32(res2[1])
                     thr = fx.Int32(res2[2])
@@ -272,7 +287,11 @@ def compile_topk():
             # full blocks packed in score order, the row's own block right after them
             preceding = full_mask & ((fx.Int64(1) << fx.Int64(lane)) - 1)
             slot = is_full.select(_popcount(preceding), n_full)
-            page = fx.Int32(_global_i32_ptr(arg_bt)[req * i32_bt_stride + valid.select(blk, fx.Int32(0))])
+            page = fx.Int32(
+                _global_i32_ptr(arg_bt)[
+                    req * i32_bt_stride + valid.select(blk, fx.Int32(0))
+                ]
+            )
             has_tail = n_valid > n_full
             tail_tokens = n_full * BLK + causal - self_blk * BLK
             full_tokens = (n_valid * BLK < causal).select(n_valid * BLK, causal)
@@ -282,7 +301,11 @@ def compile_topk():
             wr = valid | is_zero
             slot_w = valid.select(slot, lane)
             sbt = buffer_ops.create_buffer_resource_from_addr(
-                arg_sbt, num_records_bytes=fx.Int64(i32_total_q) * fx.Int64(i32_kvh) * fx.Int64(i32_sbt_stride) * 4
+                arg_sbt,
+                num_records_bytes=fx.Int64(i32_total_q)
+                * fx.Int64(i32_kvh)
+                * fx.Int64(i32_sbt_stride)
+                * 4,
             )
             sctx = _global_i32_ptr(arg_sctx)
             for h in range(fx.Int32(0), i32_kvh, fx.Int32(1)):
@@ -290,8 +313,16 @@ def compile_topk():
                 base = page * (PPB * i32_kvh) + hh
                 dst = (n * i32_kvh + hh) * i32_sbt_stride + slot_w * PPB
                 for half in range_constexpr(2):
-                    vals = [valid.select(base + (half * 4 + j) * i32_kvh, fx.Int32(0)) for j in range(4)]
-                    buffer_ops.buffer_store(fx.Vector.from_elements(vals, fx.Int32), sbt, dst + half * 4, mask=wr)
+                    vals = [
+                        valid.select(base + (half * 4 + j) * i32_kvh, fx.Int32(0))
+                        for j in range(4)
+                    ]
+                    buffer_ops.buffer_store(
+                        fx.Vector.from_elements(vals, fx.Int32),
+                        sbt,
+                        dst + half * 4,
+                        mask=wr,
+                    )
                 if lane == 0:
                     sctx[n * i32_kvh + hh] = ctx_tokens
 
@@ -318,9 +349,23 @@ def compile_topk():
         stream: fx.Stream,
     ):
         kernel(
-            arg_score, arg_out, arg_bt, arg_seq, arg_rid, arg_kvl, arg_sbt, arg_sctx,
-            i64_seq_bytes, i64_rows_bytes,
-            i32_S, i32_total_q, i32_qlen, i32_out_stride, i32_bt_stride, i32_sbt_stride, i32_kvh,
+            arg_score,
+            arg_out,
+            arg_bt,
+            arg_seq,
+            arg_rid,
+            arg_kvl,
+            arg_sbt,
+            arg_sctx,
+            i64_seq_bytes,
+            i64_rows_bytes,
+            i32_S,
+            i32_total_q,
+            i32_qlen,
+            i32_out_stride,
+            i32_bt_stride,
+            i32_sbt_stride,
+            i32_kvh,
         ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
     launch.kernel_name = name
