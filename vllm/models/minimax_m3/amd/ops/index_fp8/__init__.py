@@ -5,6 +5,6 @@ the AITER ``pa_sparse_block_score_prefill`` / ``pa_sparse_block_score_decode`` /
 ``pa_sparse_block_topk`` calls of ``indexer_aiter.py`` (same signatures, same score
 buffer contract, same sentinels)."""
 
-from .host import score_prefill
+from .host import score_prefill, topk
 
-__all__ = ["score_prefill"]
+__all__ = ["score_prefill", "topk"]

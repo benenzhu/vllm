@@ -8,6 +8,7 @@ import functools
 import torch
 
 from . import score_prefill as _score_prefill
+from . import topk as _topk
 from .utils import _run_compiled
 
 SPARSE_BLOCK_SIZE = 128
@@ -83,5 +84,80 @@ def score_prefill(
         int(init_blocks),
         int(local_blocks),
         int(_cdiv(qt * nseg * batch, 8) * 8),
+        torch.cuda.current_stream(),
+    )
+
+
+@functools.cache
+def get_topk():
+    return _topk.compile_topk()
+
+
+def topk(
+    score: torch.Tensor,  # [1, total_q, S] fp32
+    topk_idx: torch.Tensor,  # [1, total_q, 16] i32, written in place (may be a row slice)
+    block_table: torch.Tensor,  # the attend's (page-16) block table [num_reqs, stride] i32
+    seq_lens: torch.Tensor,  # [num_reqs] i32 (uniform rows)
+    sparse_bt: torch.Tensor,  # [total_q * num_kv_heads, 16 * 8] i32, written in place
+    sparse_ctx: torch.Tensor,  # [total_q * num_kv_heads] i32, written in place
+    max_seq_len: int = 0,
+    block_size: int = 0,
+    query_len: int = 1,
+    num_waves: int = 0,
+    num_valid_pages: torch.Tensor | None = None,
+    row_req_id: torch.Tensor | None = None,
+    kv_lens: torch.Tensor | None = None,
+    num_kv_heads: int = 1,
+    pages_per_block: int = 8,
+) -> None:
+    """Drop-in for AITER's ``pa_sparse_block_topk`` (one local head, topk 16,
+    8 pages per block): the 16 best blocks of every row (-1 padded) and the
+    attend's page table + token count per (row, kv head). Ragged rows come with
+    ``num_valid_pages`` / ``row_req_id`` / ``kv_lens``; uniform rows use
+    ``query_len`` and ``seq_lens``."""
+    num_idx_heads, total_q, S = score.shape
+    assert num_idx_heads == 1 and score.dtype == torch.float32 and score.stride(2) == 1
+    assert score.stride(1) == S
+    assert topk_idx.dtype == torch.int32 and topk_idx.shape[0] == 1 and topk_idx.shape[1] == total_q
+    assert topk_idx.shape[2] == _topk.TOPK and topk_idx.stride(2) == 1
+    assert block_size == _topk.BLK and pages_per_block == _topk.PPB
+    assert num_kv_heads >= 1
+    rows = total_q * num_kv_heads
+    assert sparse_bt.dtype == torch.int32 and sparse_bt.shape == (rows, _topk.TOPK * _topk.PPB)
+    assert sparse_bt.stride(1) == 1 and sparse_ctx.dtype == torch.int32 and sparse_ctx.numel() == rows
+    assert sparse_ctx.stride(0) == 1 and block_table.dtype == torch.int32 and block_table.stride(1) == 1
+    assert S >= _cdiv(max_seq_len, block_size)
+    if num_valid_pages is not None:
+        assert row_req_id is not None and kv_lens is not None
+        for t in (row_req_id, kv_lens):
+            assert t.dtype == torch.int32 and t.numel() == total_q and t.stride(0) == 1
+        qlen, rid, kvl, rows_bytes = 0, row_req_id.data_ptr(), kv_lens.data_ptr(), total_q * 4
+    else:
+        assert query_len >= 1 and total_q % query_len == 0
+        assert seq_lens.dtype == torch.int32 and seq_lens.stride(0) == 1
+        assert seq_lens.numel() == total_q // query_len
+        qlen, rid, kvl, rows_bytes = query_len, 0, 0, 0
+    if total_q == 0:
+        return
+    _run_compiled(
+        get_topk(),
+        score.data_ptr(),
+        topk_idx.data_ptr(),
+        block_table.data_ptr(),
+        seq_lens.data_ptr(),
+        rid,
+        kvl,
+        sparse_bt.data_ptr(),
+        sparse_ctx.data_ptr(),
+        int(seq_lens.numel() * 4),
+        int(rows_bytes),
+        int(S),
+        int(total_q),
+        int(qlen),
+        int(topk_idx.stride(1)),
+        int(block_table.stride(0)),
+        int(sparse_bt.stride(0)),
+        int(num_kv_heads),
+        int(_cdiv(total_q, _topk.NW)),
         torch.cuda.current_stream(),
     )
