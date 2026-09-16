@@ -1229,11 +1229,9 @@ class FusedMoEKernelModularImpl:
         """
 
         if not self.prepare_finalize.supports_async():
-            # We shouldn't be running an a2a kernel that doesn't
-            # support async prepare/finalize
-            # TODO(lucas): enable in follow-up
-            assert not dbo_enabled()
-
+            # A prepare without an all2all has nothing to overlap: under a
+            # microbatch split it just runs, the hand-offs between the two
+            # microbatches are the TP all-reduces (see ubatching).
             (
                 a1q,
                 a1q_scale,
@@ -1405,8 +1403,6 @@ class FusedMoEKernelModularImpl:
                 dimension) needed by the shared expert MLP.
         """
         if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
-
             self.prepare_finalize.finalize(
                 output,
                 fused_out,

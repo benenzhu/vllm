@@ -1920,7 +1920,13 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
-        if self.parallel_config.use_ubatching:
+        # Without expert parallelism a microbatch has no all2all to overlap; the
+        # split then only overlaps the tensor-parallel all-reduces (see
+        # VLLM_DBO_TP_ALL_REDUCE_MODE), so the all2all backend is irrelevant.
+        if (
+            self.parallel_config.use_ubatching
+            and self.parallel_config.enable_expert_parallel
+        ):
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [
                 "deepep_low_latency",

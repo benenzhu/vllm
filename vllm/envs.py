@@ -289,6 +289,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_V2_PREFER_OVERLAP: bool = False
     VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_DBO_TP_ALL_REDUCE_MODE: str = "nccl"
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -2005,6 +2006,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION", "0"))
     ),
+    # How a tensor-parallel all-reduce issued inside a microbatch (DBO) is run:
+    # "nccl" hands it to the comm stream on a per-microbatch NCCL/RCCL
+    # communicator so it overlaps the other microbatch's compute; "device" runs
+    # the group's usual all-reduce (custom / quick reduce) on the comm stream;
+    # "inline" keeps it on the compute stream (no overlap).
+    "VLLM_DBO_TP_ALL_REDUCE_MODE": lambda: (
+        os.getenv("VLLM_DBO_TP_ALL_REDUCE_MODE", "nccl") or "nccl"
+    ).lower(),
     # The number of SMs/CUs to allocate for communication kernels when
     # running DBO; the rest will be allocated to compute.
     # Default: 20 on CUDA (SMs), 64 on ROCm (CUs).

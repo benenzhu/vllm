@@ -4,7 +4,9 @@ import threading
 
 import torch
 
+import vllm.envs as envs
 from vllm import forward_context
+from vllm.distributed import parallel_state
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import current_stream
@@ -239,3 +241,96 @@ def make_ubatch_contexts(
         ctxs.append(ctx)
 
     return ctxs
+
+
+# ---------------------------------------------------------------------------
+# Tensor-parallel all-reduce overlap
+#
+# With tensor parallelism and no expert parallelism a microbatch has no
+# all2all to hide, only its TP all-reduces (attention output, MoE / MLP
+# output). Each of them is turned into a hand-off point: the microbatch records
+# its compute so far, wakes the other microbatch, and when it gets the CPU back
+# it issues the all-reduce on the comm stream, where it runs while the other
+# microbatch computes. The reduce goes through a communicator of its own per
+# microbatch so it never shares one with the collectives of the compute stream
+# (a NCCL communicator's operations must be issued in one order on one stream).
+# ---------------------------------------------------------------------------
+
+_TP_UBATCH_COMMS: list | None = None
+
+
+def _tp_all_reduce_overlap_wanted() -> bool:
+    return envs.VLLM_DBO_TP_ALL_REDUCE_MODE != "inline"
+
+
+def init_dbo_tp_comms(num_ubatches: int) -> None:
+    """Build the per-microbatch TP communicators (a collective: every rank
+    must call it, in the same order). No-op unless the mode is "nccl"."""
+    global _TP_UBATCH_COMMS
+    if _TP_UBATCH_COMMS is not None or envs.VLLM_DBO_TP_ALL_REDUCE_MODE != "nccl":
+        return
+    tp = parallel_state.get_tp_group()
+    if tp.world_size == 1:
+        _TP_UBATCH_COMMS = [None] * num_ubatches
+        return
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    comms = [
+        PyNcclCommunicator(group=tp.cpu_group, device=tp.device)
+        for _ in range(num_ubatches)
+    ]
+    if any(c.disabled for c in comms):
+        logger.warning(
+            "DBO: the NCCL library is unavailable, the TP all-reduces of a "
+            "microbatch stay on the compute stream (no overlap)"
+        )
+        _TP_UBATCH_COMMS = [None] * num_ubatches
+        return
+    _TP_UBATCH_COMMS = comms
+    logger.info(
+        "DBO: %d per-microbatch TP communicators for the comm-stream all-reduce",
+        num_ubatches,
+    )
+
+
+def _dbo_tp_all_reduce(group, input_: torch.Tensor) -> torch.Tensor | None:
+    """The hook installed into GroupCoordinator.all_reduce."""
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return None
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+    if ctx_idx is None or group is not parallel_state._TP:
+        return None
+    mode = envs.VLLM_DBO_TP_ALL_REDUCE_MODE
+    if mode == "inline":
+        return None
+    ctx = _CURRENT_CONTEXTS[ctx_idx]
+    logger.info_once(
+        "DBO: TP all-reduces of a microbatch go to the comm stream (mode %s)", mode
+    )
+
+    if mode == "nccl":
+        comm = _TP_UBATCH_COMMS[ctx_idx] if _TP_UBATCH_COMMS is not None else None
+        if comm is None:
+            return None
+        # The output is allocated on the compute stream, where it is consumed;
+        # the comm stream only writes it.
+        out = torch.empty_like(input_)
+        ctx.yield_and_switch_from_compute_to_comm()
+        input_.record_stream(ctx.comm_stream)
+        out.record_stream(ctx.comm_stream)
+        comm.all_reduce(input_, out_tensor=out, stream=ctx.comm_stream)
+        ctx.switch_to_compute_sync()
+        return out
+
+    # "device": the group's own all-reduce (custom / quick reduce / nccl) on
+    # the comm stream; its output is allocated there and lives on the compute
+    # stream afterwards.
+    ctx.yield_and_switch_from_compute_to_comm()
+    input_.record_stream(ctx.comm_stream)
+    out = group._all_reduce_out_place(input_)
+    out.record_stream(ctx.compute_stream)
+    ctx.switch_to_compute_sync()
+    return out
+
+
+parallel_state.set_dbo_tp_all_reduce_hook(_dbo_tp_all_reduce)

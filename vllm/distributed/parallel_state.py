@@ -736,6 +736,14 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # Inside a microbatch (DBO) the TP all-reduce may be handed to the comm
+        # stream so it overlaps the other microbatch; the hook returns None
+        # whenever that does not apply.
+        if _dbo_tp_all_reduce_hook is not None:
+            out = _dbo_tp_all_reduce_hook(self, input_)
+            if out is not None:
+                return out
+
         if self.use_custom_op_call:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
@@ -1539,6 +1547,18 @@ def _replace_active_groups(
     _EPLB = eplb
     _NODE_COUNT = node_count
     return old_groups
+
+
+# Set by vllm.v1.worker.ubatching: (group, tensor) -> reduced tensor, or None
+# when the call is not inside a microbatch that overlaps its TP all-reduces.
+_dbo_tp_all_reduce_hook: Callable[[GroupCoordinator, torch.Tensor], torch.Tensor | None] | None = None
+
+
+def set_dbo_tp_all_reduce_hook(
+    hook: Callable[[GroupCoordinator, torch.Tensor], torch.Tensor | None] | None,
+) -> None:
+    global _dbo_tp_all_reduce_hook
+    _dbo_tp_all_reduce_hook = hook
 
 
 _TP: GroupCoordinator | None = None

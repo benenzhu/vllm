@@ -225,6 +225,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
+    is_last_ubatch_empty,
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
@@ -4046,6 +4047,19 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        elif self.parallel_config.use_ubatching and allow_microbatching:
+            # A single DP rank has nobody to agree with: decide the split here.
+            # Only steps that run without a cudagraph are split (a split step
+            # is run eagerly by the UBatchWrapper).
+            should_ubatch = (
+                cudagraph_mode == CUDAGraphMode.NONE
+                and check_ubatch_thresholds(
+                    self.parallel_config, num_tokens, uniform_decode=uniform_decode
+                )
+                and not is_last_ubatch_empty(
+                    num_tokens, num_tokens_padded, self.parallel_config.num_ubatches
+                )
+            )
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -5455,18 +5469,17 @@ class GPUModelRunner(
         # wrap the model with full cudagraph wrapper if needed.
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
-        if (
-            is_breakable_cudagraph_enabled()
-            and cudagraph_mode != CUDAGraphMode.NONE
-            and not self.parallel_config.use_ubatching
-        ):
+        if is_breakable_cudagraph_enabled() and cudagraph_mode != CUDAGraphMode.NONE:
             # Scoped to PIECEWISE dispatch; FULL cudagraphs (below) are
             # unaffected. PIECEWISE dispatch can also arise after wrapping
             # (drafters under a FULL target mode, or a later FULL ->
             # FULL_AND_PIECEWISE upgrade in _check_and_update_cudagraph_mode).
-            self.model = BreakableCUDAGraphWrapper(
-                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
-            )
+            # Under microbatching the UBatchWrapper owns the PIECEWISE wrapper
+            # of the model (its non-split steps), the drafter keeps its own.
+            if not self.parallel_config.use_ubatching:
+                self.model = BreakableCUDAGraphWrapper(
+                    self.model, self.vllm_config, runtime_mode=CUDAGraphMode.PIECEWISE
+                )
             drafter = getattr(self, "drafter", None)
             if drafter is not None and hasattr(drafter, "model"):
                 drafter.model = BreakableCUDAGraphWrapper(

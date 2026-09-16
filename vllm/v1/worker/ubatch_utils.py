@@ -319,6 +319,21 @@ def _make_metadata_with_slice(
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
+    positions = (
+        attn_metadata.positions[token_slice]
+        if attn_metadata.positions is not None
+        else None
+    )
+    is_prefilling = (
+        attn_metadata.is_prefilling[request_slice]
+        if attn_metadata.is_prefilling is not None
+        else None
+    )
+    req_idx = (
+        attn_metadata.req_idx[request_slice]
+        if attn_metadata.req_idx is not None
+        else None
+    )
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
@@ -330,7 +345,11 @@ def _make_metadata_with_slice(
         max_seq_len=max_seq_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        causal=attn_metadata.causal,
+        positions=positions,
+        is_prefilling=is_prefilling,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        req_idx=req_idx,
     )
 
 
