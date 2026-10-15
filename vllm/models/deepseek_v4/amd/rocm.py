@@ -35,7 +35,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-    build_prefill_topk_ragged_indices,
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
     rocm_inverse_rope_rows_,
@@ -473,9 +472,6 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
-    # Built only for the aiter prefill, which reads the SWA cache in place.
-    prefill_swa_ragged_indices: torch.Tensor | None = None
-    prefill_swa_ragged_indptr: torch.Tensor | None = None
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
@@ -595,9 +591,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
-        self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(
-            self.vllm_config.kv_transfer_config is not None
-        )
 
     def build(
         self,
@@ -612,23 +605,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             fast_build=fast_build,
             replay_start=replay_start,
         )
-
-        prefill_ragged_indices = None
-        prefill_ragged_indptr = None
-        if (
-            self._use_aiter_sparse_mla
-            and base.num_prefill_tokens > 0
-            and base.prefill_swa_indices is not None
-            and base.prefill_swa_lens is not None
-        ):
-            # Paged-coordinate rows (image visibility included), so every
-            # layer's prefill shares one build.
-            prefill_ragged_indices, prefill_ragged_indptr = (
-                build_ragged_indices_from_dense(
-                    base.prefill_swa_indices.reshape(base.num_prefill_tokens, -1),
-                    base.prefill_swa_lens,
-                )
-            )
 
         ragged_indices = None
         ragged_indptr = None
@@ -656,8 +632,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
-            prefill_swa_ragged_indices=prefill_ragged_indices,
-            prefill_swa_ragged_indptr=prefill_ragged_indptr,
         )
 
 
@@ -1248,20 +1222,18 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         if attn_metadata is None:
             # Warmup dummy run: no real metadata. Reserve the same bf16
             # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step. The aiter prefill
-            # reads the caches in place and never asks for it.
-            if not self._use_aiter_sparse_mla:
-                swa_only = self.compress_ratio <= 1
-                N = (
-                    0
-                    if swa_only
-                    else (self.max_model_len + self.compress_ratio - 1)
-                    // self.compress_ratio
-                )
-                M = N + self.window_size + self.max_num_batched_tokens
-                current_workspace_manager().get_simultaneous(
-                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-                )
+            # / sparse_fwd kernels are skipped this step.
+            swa_only = self.compress_ratio <= 1
+            N = (
+                0
+                if swa_only
+                else (self.max_model_len + self.compress_ratio - 1)
+                // self.compress_ratio
+            )
+            M = N + self.window_size + self.max_num_batched_tokens
+            current_workspace_manager().get_simultaneous(
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )
             output.zero_()
             return
 
@@ -1427,17 +1399,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
     ) -> None:
-        if self._use_aiter_sparse_mla:
-            self._forward_prefill_aiter(
-                q=q,
-                compressed_k_cache=compressed_k_cache,
-                swa_k_cache=swa_k_cache,
-                output=output,
-                attn_metadata=attn_metadata,
-                swa_metadata=swa_metadata,
-            )
-            return
-
         swa_only = attn_metadata is None
 
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -1558,65 +1519,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
-
-    def _forward_prefill_aiter(
-        self,
-        q: torch.Tensor,
-        compressed_k_cache: torch.Tensor | None,
-        swa_k_cache: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
-        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
-    ) -> None:
-        """Prefill straight off the paged caches, with no bf16 gather."""
-        num_decode_tokens = swa_metadata.num_decode_tokens
-        num_prefill_tokens = swa_metadata.num_prefill_tokens
-        assert swa_metadata.prefill_swa_ragged_indices is not None
-        assert swa_metadata.prefill_swa_ragged_indptr is not None
-
-        topk_ragged_indices = None
-        topk_ragged_indptr = None
-        if attn_metadata is None:
-            compressed_k_cache = None
-        else:
-            assert compressed_k_cache is not None
-            assert swa_metadata.token_to_req_indices is not None
-            assert swa_metadata.query_start_loc is not None
-            assert swa_metadata.seq_lens is not None
-            assert swa_metadata.is_valid_token is not None
-            if self.compress_ratio == 4:
-                assert self.topk_indices_buffer is not None
-                topk_indices = self.topk_indices_buffer[
-                    num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                ]
-            else:
-                topk_indices = attn_metadata.c128a_prefill_topk_indices
-            assert topk_indices is not None
-            topk_ragged_indices, topk_ragged_indptr = build_prefill_topk_ragged_indices(
-                topk_indices,
-                swa_metadata.token_to_req_indices,
-                swa_metadata.query_start_loc,
-                swa_metadata.seq_lens,
-                swa_metadata.is_valid_token,
-                attn_metadata.block_table,
-                block_size=attn_metadata.block_size // self.compress_ratio,
-                compress_ratio=self.compress_ratio,
-                num_compressed=(self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio,
-                token_offset=num_decode_tokens,
-                num_rows=compressed_k_cache.shape[0] * compressed_k_cache.shape[1],
-            )
-
-        self._aiter_sparse_mla(
-            q[:num_prefill_tokens],
-            output[:num_prefill_tokens],
-            swa_k_cache,
-            swa_metadata.prefill_swa_ragged_indices,
-            swa_metadata.prefill_swa_ragged_indptr,
-            compressed_k_cache,
-            topk_ragged_indices,
-            topk_ragged_indptr,
-        )
 
     def _aiter_sparse_mla(
         self,

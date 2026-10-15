@@ -1341,8 +1341,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether sparse MLA prefill and decode run on aiter's Triton kernel, which
     # reads the KV cache as stored (bf16 or fp8, paged or flat). Used by the
-    # ROCM_AITER_MLA_SPARSE backend (DeepSeek V3.2, GLM-5.x) and DeepSeek
-    # V4 / V4.1. gfx950 only. By default is disabled.
+    # ROCM_AITER_MLA_SPARSE backend (DeepSeek V3.2, GLM-5.x), DeepSeek V4.1
+    # and DeepSeek V4 decode. gfx950 only. By default is disabled.
     "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA", "False").lower()
         in ("true", "1")

@@ -149,28 +149,23 @@ def test_forward_mqa_prepares_triton_sparse_mla_inputs(
     assert lse is None
 
 
-@pytest.mark.parametrize(
-    ("model", "compress_ratio"),
-    [("deepseek_v41", 1), ("deepseek_v41", 2), ("deepseek_v4", 4)],
-)
+@pytest.mark.parametrize("compress_ratio", [1, 2])
 @torch.inference_mode()
 def test_paged_prefill_indices_match_gathered_prefill(
-    monkeypatch, model: str, compress_ratio: int
+    monkeypatch, compress_ratio: int
 ) -> None:
     """The aiter prefill reads the paged caches through the SWA builder's rows
     and build_prefill_topk_ragged_indices, and must attend exactly the keys the
     dequantize-and-gather prefill does."""
-    import importlib
-
     from tests.v1.attention.utils import create_vllm_config
     from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.models.deepseek_v41.amd import rocm
     from vllm.v1.attention.backend import CommonAttentionMetadata
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         build_prefill_topk_ragged_indices,
     )
     from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
-    rocm = importlib.import_module(f"vllm.models.{model}.amd.rocm")
     device = torch.device("cuda")
     gen = torch.Generator().manual_seed(compress_ratio)
     window, width, block_size, max_model_len = 16, 32, 16, 128
