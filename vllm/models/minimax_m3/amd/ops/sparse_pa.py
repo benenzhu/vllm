@@ -552,7 +552,9 @@ def _run_gluon_decode(
     # V is offset by half a block when the sides interleave, so it holds fewer
     # pages than K even though both are addressed by the same page id.
     v_nphys16 = v_cache.shape[0]
-    k_cache_view = k_cache.view(nphys16 * hkv, 1, *k_cache.shape[2:])
+    # Gluon PA asserts equal K/V page counts; K pages past V's count are never
+    # addressed (each block's K pages precede its V pages), so drop them.
+    k_cache_view = k_cache.view(nphys16 * hkv, 1, *k_cache.shape[2:])[: v_nphys16 * hkv]
     v_cache_view = v_cache.view(v_nphys16 * hkv, 1, *v_cache.shape[2:])
     q_view = q.view(total_q * num_kv_heads, group_size, head_size)
     out_view = output.view(total_q * num_kv_heads, group_size, head_size)
