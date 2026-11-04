@@ -104,6 +104,10 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
 from vllm.models.minimax_m3.amd.mono.kernels.common import (
     block_max as block_max_of,
 )
+from vllm.models.minimax_m3.amd.mono.kernels.index_score import (
+    index_scale_log2e,
+    step_rows,
+)
 from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import (
     e4m3x8,
     f16_pair,
@@ -111,10 +115,6 @@ from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import (
     k_scale_off,
     scale_pair,
     scale_pairs8,
-)
-from vllm.models.minimax_m3.amd.mono.kernels.index_score import (
-    index_scale_log2e,
-    step_rows,
 )
 from vllm.models.minimax_m3.amd.mono.kernels.pre_attn import (
     K1_ARGS,
@@ -263,8 +263,7 @@ def build_post_attn_kernel(
         # mid; wide: also the split's PV partials (the stages take turns)
         x: fx.Array[fx.Int32, POOL, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        # the split's P (fp8); NVFP4: also its fp16 q before (H * HEAD_DIM halves:
-        # the same 4 KB; QK reads q before the barrier P is stored after)
+        # the split's P; NVFP4 also its fp16 q (read before P is stored)
         p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
         opart: fx.Array[fx.Float32, 1 if WIDE else WAVES * O_K, 16]  # PV partials
@@ -918,6 +917,7 @@ def build_post_attn_kernel(
                 """PV output column (B column l16) jd's dim: 16 jd + l16, NVFP4
                 64 (jd / 4) + 4 l16 + jd % 4 (a lane's 4 dims in one dword run)."""
                 return 64 * (jd // 4) + 4 * l16 + jd % 4 if nvfp4 else 16 * jd + l16
+
             PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
             for ts in range(start("split"), N_SPLIT * tokens, G):
                 ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
@@ -954,12 +954,9 @@ def build_post_attn_kernel(
                 ]
                 qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
                 if const_expr(nvfp4):
-                    # NVFP4 pages (``nvfp4.py``): page id = page128 * 8 + its
-                    # page-16. K (QK B operand, exact fp16) key l16 of page j, dims
-                    # 32 g4 + 8 s .. + 8 for chunk s (a 16 B load; the fp16 q A
-                    # operand takes the same k order); V (PV B operand, e4m3) dim
-                    # kv_dim(jd) of keys 8 (lane / 16) .. + 8: the octet's dword,
-                    # two 16 B loads. The scales are the layer's global ones.
+                    # NVFP4 (nvfp4.py): page id = page128 * 8 + page16. K: fp16, key
+                    # l16, dims 32 g4 + 8 s for chunk s (q takes the same order);
+                    # V: e4m3, dims kv_dim(jd), keys 8 g4 .. + 8; global scales.
                     kw = []
                     for j in range_constexpr(PPW):
                         kb = (pages[j] >> 3) * NVFP4_PAGE_BYTES
@@ -974,9 +971,7 @@ def build_post_attn_kernel(
                             )
                         )
                         soff = (
-                            kb
-                            + NVFP4_CODES * SPARSE_BLOCK
-                            + k_scale_off(ktok, 2 * g4)
+                            kb + NVFP4_CODES * SPARSE_BLOCK + k_scale_off(ktok, 2 * g4)
                         )
                         sw = fx.Int32(
                             bo.buffer_load(
@@ -1025,12 +1020,8 @@ def build_post_attn_kernel(
                         )
                         pairs = scale_pairs8(vsc[0], vsc[1])
                         vw += [e4m3x8(vcodes[i], pairs) for i in range(4)]
-                    gks = fx.Float32(
-                        bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32)
-                    )
-                    gvs = fx.Float32(
-                        bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32)
-                    )
+                    gks = fx.Float32(bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32))
+                    gvs = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
                     kss = [gks] * PPW
                     vss = [gvs] * PPW
                 else:

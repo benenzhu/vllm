@@ -122,11 +122,9 @@ def configure(
 
 
 def cache_geometry() -> tuple:
-    """(KV_PAGE_STRIDE, STATIC_KV_SCALE, KV_FORMAT) as configured. The kernels read
-    these module values while tracing, which FlyDSL's JIT cache key (source and
-    scalar closure values) does not see: each builder captures this tuple in its
-    kernel body (``check_cache_geometry``), so every geometry gets its own binary
-    (a shared cache dir otherwise served an NVFP4 build to an fp8 deployment)."""
+    """The cache geometry the kernels read while tracing. FlyDSL's JIT cache key
+    does not see module values, so each builder captures this in its kernel body
+    (``check_cache_geometry``) to keep one binary per geometry."""
     return (KV_PAGE_STRIDE, STATIC_KV_SCALE, KV_FORMAT)
 
 

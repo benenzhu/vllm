@@ -79,9 +79,10 @@ def forward_checked(
         mono_pages = None if pages is None else _nvfp4_pages(layer, pages)
         ref_h, ref_res = layer(positions, h_in, res_in)
         if mono_pages is not None and runner.rank == 0:
+            ref_pages = _nvfp4_pages(layer, pages)
             logger.info(
                 "mono check layer %d nvfp4 insert bytes differing (%d tokens): %s",
-                lw.layer_id, n, _nvfp4_byte_diff(mono_pages, _nvfp4_pages(layer, pages)),
+                lw.layer_id, n, _nvfp4_byte_diff(mono_pages, ref_pages),
             )  # fmt: skip
         if aux_hidden_states is not None:
             runner.model._maybe_add_hidden_state(

@@ -276,7 +276,9 @@ class MonoDecodeRunner:
         returned residual)."""
         n = res.shape[0]
         block_table, seq_lens, slots, q_len = tables
-        k_cache, v_cache, k_scale, v_scale = self.kv_ptrs[lw.layer_id]
+        kv = self.kv_ptrs[lw.layer_id]
+        assert kv is not None
+        k_cache, v_cache, k_scale, v_scale = kv
         self.k4[n](
             _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens),
             k_cache, v_cache, k_scale, v_scale,

@@ -70,7 +70,7 @@ class SparseMoeLayer:
 
     layer_id: int
     attn: object  # MiniMaxM3SparseAttention: layer name, KV cache views, scales
-    index_cache: torch.Tensor  # fp8 [blocks, block, head_dim] or NVFP4 u8 [blocks, block, 72]
+    index_cache: torch.Tensor  # fp8 [blocks, 128, 128] or NVFP4 u8 [blocks, 128, 72]
     g_in: torch.Tensor
     w_qkv: torch.Tensor
     s_qkv: torch.Tensor

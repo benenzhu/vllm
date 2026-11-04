@@ -148,24 +148,26 @@ def e4m3x8_words(codes, pairs):
     clamped to +-448 and rounded once (``e4m3_rn_satfinite``)."""
     big = Vec.filled(2, E4M3_MAX, fx.Float16)
     small = Vec.filled(2, -E4M3_MAX, fx.Float16)
-    f8 = [None, None]
-    for j in range_constexpr(4):
-        v = cvt_fp4x2_f16(codes, j) * pairs[j]
-        v = _arith.MinNumFOp(
-            fx.as_ir_value(v), fx.as_ir_value(big), fastmath=_nnan()
-        ).result
-        v = _arith.MaxNumFOp(v, fx.as_ir_value(small), fastmath=_nnan()).result
-        old = Vec.filled(2, 0, fx.Int16) if j % 2 == 0 else f8[j // 2]
-        f8[j // 2] = Vec(
-            fx.rocdl.cvt_scalef32_pk_fp8_f16(
-                Vec.make_type(2, fx.Int16),
-                fx.as_ir_value(old),
-                v,
-                fx.as_ir_value(fx.Float32(1.0)),
-                j % 2 == 1,
+    words = []
+    for h in range_constexpr(2):
+        pk = Vec.filled(2, 0, fx.Int16)
+        for j in (2 * h, 2 * h + 1):
+            v = cvt_fp4x2_f16(codes, j) * pairs[j]
+            v = _arith.MinNumFOp(
+                fx.as_ir_value(v), fx.as_ir_value(big), fastmath=_nnan()
+            ).result
+            v = _arith.MaxNumFOp(v, fx.as_ir_value(small), fastmath=_nnan()).result
+            pk = Vec(
+                fx.rocdl.cvt_scalef32_pk_fp8_f16(
+                    Vec.make_type(2, fx.Int16),
+                    fx.as_ir_value(pk),
+                    v,
+                    fx.as_ir_value(fx.Float32(1.0)),
+                    j % 2 == 1,
+                )
             )
-        )
-    return [f8[h].bitcast(fx.Int32)[0] for h in range(2)]
+        words.append(pk.bitcast(fx.Int32)[0])
+    return words
 
 
 def e4m3x8(codes, pairs):
