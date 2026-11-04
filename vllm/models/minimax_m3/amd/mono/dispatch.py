@@ -4,7 +4,9 @@
 
 The deployment is checked once (``_config_refusal``); a step is routed to the
 kernels only when it is a pure decode of 1..MAX_TOKENS tokens whose tables the
-kernels can read (``_step_refusal``). Every per-step condition is decided from
+kernels can read, run eagerly or as a full CUDA graph (``_step_refusal``): a
+piecewise (breakable) replay keeps the stock path, whose attention runs between
+the pieces. Every per-step condition is decided from
 TP-replicated state: the kernels all-reduce in-kernel, so ranks that disagreed
 would wait on each other forever.
 
@@ -18,7 +20,7 @@ from typing import Any, cast
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.amd.mono.check import forward_checked
@@ -58,7 +60,6 @@ def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
     """Why this deployment cannot use the kernels at all, or None."""
     pc = vllm_config.parallel_config
     cc = vllm_config.cache_config
-    cg = vllm_config.compilation_config.cudagraph_mode
     max_len = vllm_config.model_config.max_model_len
     index_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("bf16")
     checks = (
@@ -74,7 +75,6 @@ def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
         ),
         (cc.block_size == SPARSE_BLOCK, f"block size {cc.block_size}"),
         (max_len <= MAX_CONTEXT, f"max_model_len {max_len} > {MAX_CONTEXT}"),
-        (cg is None or not cg.requires_piecewise_compilation(), "piecewise cudagraph"),
         (
             getattr(model, "is_fused_shared_expert_enabled", False)
             or _separate_shared_ok(model.layers),
@@ -98,6 +98,8 @@ def _step_refusal(
         return f"positions {positions.dtype}"
     if fwd.ubatch_slices is not None:
         return "microbatched"
+    if fwd.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        return "piecewise cudagraph step"
     if not isinstance(fwd.attn_metadata, dict) or not isinstance(
         fwd.slot_mapping, dict
     ):

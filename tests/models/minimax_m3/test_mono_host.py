@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
+
 pytest.importorskip("flydsl")
 
 from vllm.models.minimax_m3.amd.mono import config as mono_config  # noqa: E402
@@ -220,6 +222,7 @@ def _fwd(n: int, q: int = 1, reqs: int | None = None, prefills: int = 0):
     md = SimpleNamespace(decode=decode, num_prefills=prefills)
     return SimpleNamespace(
         ubatch_slices=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
         attn_metadata={"attn": md},
         slot_mapping={"attn": torch.zeros(n, dtype=torch.int64)},
     )
@@ -229,6 +232,27 @@ def test_step_refusal_accepts_a_pure_decode():
     pos = torch.zeros(4, dtype=torch.int64)
     assert _step_refusal(_fwd(4), "attn", 4, pos) is None
     assert _step_refusal(_fwd(6, q=3), "attn", 6, pos) is None
+
+
+@pytest.mark.parametrize(
+    "mode, ok",
+    [
+        (CUDAGraphMode.NONE, True),
+        (CUDAGraphMode.FULL, True),
+        (CUDAGraphMode.PIECEWISE, False),
+    ],
+)
+def test_step_refusal_runs_eager_and_full_graph_steps_only(mode, ok):
+    fwd = _fwd(8, q=8)
+    fwd.cudagraph_runtime_mode = mode
+    reason = _step_refusal(fwd, "attn", 8, torch.zeros(8, dtype=torch.int64))
+    assert (reason is None) if ok else ("piecewise" in reason)
+
+
+def test_config_refusal_accepts_breakable_piecewise_graphs():
+    cg = SimpleNamespace(requires_piecewise_compilation=lambda: True)
+    cfg = _vllm_config(**{"compilation_config.cudagraph_mode": cg})
+    assert _config_refusal(cfg, _model()) is None
 
 
 def _step_reason(fwd, n: int, positions: torch.Tensor) -> str:
