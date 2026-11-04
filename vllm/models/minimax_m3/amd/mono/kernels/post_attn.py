@@ -301,6 +301,8 @@ def build_post_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own = heads.count, heads.own
+    # the cache geometry in the JIT cache key (config.cache_geometry)
+    kv_geometry = mono_config.cache_geometry()
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4
@@ -344,6 +346,7 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
     ):
+        mono_config.check_cache_geometry(kv_geometry)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % 64

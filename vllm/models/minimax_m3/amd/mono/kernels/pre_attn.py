@@ -884,6 +884,8 @@ def build_pre_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own = heads.count, heads.own
+    # the cache geometry in the JIT cache key (config.cache_geometry)
+    kv_geometry = mono_config.cache_geometry()
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def pre_attn_kernel(
@@ -917,6 +919,7 @@ def build_pre_attn_kernel(
         layer: Int32,
         tl: Int64,
     ):
+        mono_config.check_cache_geometry(kv_geometry)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % 64

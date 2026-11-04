@@ -456,6 +456,8 @@ def build_index_score_kernel(
     scale = index_scale_log2e(sm_scale)
     # the JIT cache key holds scalar closure values only: the heads go in as ints
     ih_count, ih_own = heads.count, heads.own
+    # the cache geometry in the JIT cache key (config.cache_geometry)
+    kv_geometry = mono_config.cache_geometry()
 
     @fx.struct
     class Smem:
@@ -482,6 +484,7 @@ def build_index_score_kernel(
         step: Int64,
         layer: Int32,
     ):
+        mono_config.check_cache_geometry(kv_geometry)
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
         red = lds.red.ptr

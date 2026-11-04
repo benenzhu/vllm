@@ -121,5 +121,19 @@ def configure(
     KV_FORMAT = kv_format
 
 
+def cache_geometry() -> tuple:
+    """(KV_PAGE_STRIDE, STATIC_KV_SCALE, KV_FORMAT) as configured. The kernels read
+    these module values while tracing, which FlyDSL's JIT cache key (source and
+    scalar closure values) does not see: each builder captures this tuple in its
+    kernel body (``check_cache_geometry``), so every geometry gets its own binary
+    (a shared cache dir otherwise served an NVFP4 build to an fp8 deployment)."""
+    return (KV_PAGE_STRIDE, STATIC_KV_SCALE, KV_FORMAT)
+
+
+def check_cache_geometry(geometry: tuple) -> None:
+    """At trace time: the kernel is traced for the geometry it was built for."""
+    assert geometry == cache_geometry(), (geometry, cache_geometry())
+
+
 class MonoUnsupported(Exception):
     """The loaded model or runtime configuration is outside what mono serves."""
