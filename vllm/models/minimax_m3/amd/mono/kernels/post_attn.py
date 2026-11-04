@@ -66,6 +66,8 @@ from vllm.models.minimax_m3.amd.mono.config import (
     MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
+    NVFP4_CODES,
+    NVFP4_PAGE_BYTES,
     ONE_INDEX_HEAD,
     PAGE16,
     SHARED_EXPERT,
@@ -100,6 +102,12 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
 )
 from vllm.models.minimax_m3.amd.mono.kernels.common import (
     block_max as block_max_of,
+)
+from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import (
+    e4m3x8,
+    k_scale_off,
+    scale_pair,
+    scale_pairs8,
 )
 from vllm.models.minimax_m3.amd.mono.kernels.index_score import (
     index_scale_log2e,
@@ -285,6 +293,7 @@ def build_post_attn_kernel(
         tl=timeline,
         kps=mono_config.KV_PAGE_STRIDE,
         sks=mono_config.STATIC_KV_SCALE,
+        nv4=mono_config.KV_FORMAT == "nvfp4",
         sf8=shared_fp8,
     )
 
@@ -892,6 +901,17 @@ def build_post_attn_kernel(
         def stage_split():
             r_k, r_v = rsrc(k_cache), rsrc(v_cache)
             r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
+            nvfp4 = mono_config.KV_FORMAT == "nvfp4"
+
+            def q_k(s):
+                """Dword of q8's head row holding this lane's k of chunk s (the
+                operand dims: 32 s + 8 g4, NVFP4 32 g4 + 8 s)."""
+                return 8 * g4 + 2 * s if nvfp4 else 8 * s + 2 * g4
+
+            def kv_dim(jd):
+                """PV output column (B column l16) jd's dim: 16 jd + l16, NVFP4
+                64 (jd / 4) + 4 l16 + jd % 4 (a lane's 4 dims in one dword run)."""
+                return 64 * (jd // 4) + 4 * l16 + jd % 4 if nvfp4 else 16 * jd + l16
             PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
             for ts in range(start("split"), N_SPLIT * tokens, G):
                 ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
@@ -927,66 +947,152 @@ def build_post_attn_kernel(
                     uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)
                 ]
                 qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
-                # K (QK B operand, key = lane % 16 of page j), V (PV B operand: dims
-                # 16 jd + lane % 16, keys 8 (lane / 16) .. + 8), per-token scales
-                kw = []
-                for j in range_constexpr(PPW):
-                    for s in range_constexpr(HEAD_DIM // 32):
-                        kw.append(
-                            fx.Vector(
-                                bo.buffer_load(
-                                    r_k,
-                                    (
-                                        pages[j] * PAGE_BYTES
-                                        + (2 * s + g4 // 2) * 256
-                                        + l16 * 16
-                                        + (g4 % 2) * 8
-                                    )
-                                    // 4,
-                                    vec_width=2,
-                                    dtype=T.i32,
-                                    cache_modifier=CM_K1,
+                if const_expr(nvfp4):
+                    # NVFP4 pages (``nvfp4.py``): page id = page128 * 8 + its
+                    # page-16. K (QK B operand) key l16 of page j, dims 32 g4 + 8 s
+                    # .. + 8 for chunk s (a 16 B load; the q A operand takes the
+                    # same k order); V (PV B operand) dim kv_dim(jd) of keys
+                    # 8 (lane / 16) .. + 8: the octet's dword, two 16 B loads.
+                    # The scales are the layer's global ones.
+                    kw = []
+                    for j in range_constexpr(PPW):
+                        kb = (pages[j] >> 3) * NVFP4_PAGE_BYTES
+                        ktok = (pages[j] & 7) * PAGE16 + l16
+                        codes = fx.Vector(
+                            bo.buffer_load(
+                                r_k,
+                                (kb + ktok * NVFP4_CODES + 16 * g4) // 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
+                        )
+                        soff = (
+                            kb
+                            + NVFP4_CODES * SPARSE_BLOCK
+                            + k_scale_off(ktok, 2 * g4)
+                        )
+                        sw = fx.Int32(
+                            bo.buffer_load(
+                                r_k,
+                                soff // 4,
+                                vec_width=1,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
+                        ) >> ((soff % 4) * 8)
+                        for ch in range_constexpr(HEAD_DIM // 32):
+                            kw.append(
+                                e4m3x8(
+                                    codes[ch],
+                                    [scale_pair((sw >> ((ch // 2) * 8)) & 0xFF)] * 4,
                                 )
-                            ).bitcast(fx.Int64)[0]
+                            )
+                    vpg = (g4 // 2 == 0).select(pages[0], pages[1])
+                    vb = (vpg >> 3) * NVFP4_PAGE_BYTES
+                    vtok = (vpg & 7) * PAGE16 + (g4 % 2) * 8
+                    vw = []
+                    for h in range_constexpr(2):
+                        vcodes = fx.Vector(
+                            bo.buffer_load(
+                                r_v,
+                                (vb + (vtok // 8) * 512 + (64 * h + 4 * l16) * 4) // 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
                         )
-                vpg = (g4 // 2 == 0).select(pages[0], pages[1])
-                vw = [
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_v,
-                            (vpg * PAGE_BYTES + (16 * jd + l16) * PAGE16 + (g4 % 2) * 8)
-                            // 4,
-                            vec_width=2,
-                            dtype=T.i32,
-                            cache_modifier=CM_K1,
+                        vsc = fx.Vector(
+                            bo.buffer_load(
+                                r_v,
+                                (
+                                    vb
+                                    + NVFP4_CODES * SPARSE_BLOCK
+                                    + (4 * h + l16 // 4) * SPARSE_BLOCK
+                                    + vtok
+                                )
+                                // 4,
+                                vec_width=2,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
                         )
-                    ).bitcast(fx.Int64)[0]
-                    for jd in range(HEAD_DIM // 16)
-                ]
-                kss = [
-                    fx.Float32(
-                        bo.buffer_load(
-                            r_ks,
-                            pages[j] * PAGE16 + l16,
-                            vec_width=1,
-                            dtype=T.f32,
-                            cache_modifier=CM_K1,
-                        )
+                        pairs = scale_pairs8(vsc[0], vsc[1])
+                        vw += [e4m3x8(vcodes[i], pairs) for i in range(4)]
+                    gks = fx.Float32(
+                        bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32)
                     )
-                    for j in range(PPW)
-                ]
-                vss = [
-                    fx.Float32(
-                        bo.buffer_load(
-                            r_vs,
-                            pages[j] * PAGE16 + l16,
-                            vec_width=1,
-                            dtype=T.f32,
-                            cache_modifier=CM_K1,
-                        )
+                    gvs = fx.Float32(
+                        bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32)
                     )
-                    for j in range(PPW)
-                ]
+                    kss = [gks] * PPW
+                    vss = [gvs] * PPW
+                else:
+                    # K (QK B operand, key = lane % 16 of page j), V (PV B operand:
+                    # dims 16 jd + lane % 16, keys 8 (lane / 16) .. + 8), per-token
+                    # scales
+                    kw = []
+                    for j in range_constexpr(PPW):
+                        for s in range_constexpr(HEAD_DIM // 32):
+                            kw.append(
+                                fx.Vector(
+                                    bo.buffer_load(
+                                        r_k,
+                                        (
+                                            pages[j] * PAGE_BYTES
+                                            + (2 * s + g4 // 2) * 256
+                                            + l16 * 16
+                                            + (g4 % 2) * 8
+                                        )
+                                        // 4,
+                                        vec_width=2,
+                                        dtype=T.i32,
+                                        cache_modifier=CM_K1,
+                                    )
+                                ).bitcast(fx.Int64)[0]
+                            )
+                    vpg = (g4 // 2 == 0).select(pages[0], pages[1])
+                    vw = [
+                        fx.Vector(
+                            bo.buffer_load(
+                                r_v,
+                                (
+                                    vpg * PAGE_BYTES
+                                    + (16 * jd + l16) * PAGE16
+                                    + (g4 % 2) * 8
+                                )
+                                // 4,
+                                vec_width=2,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
+                        ).bitcast(fx.Int64)[0]
+                        for jd in range(HEAD_DIM // 16)
+                    ]
+                    kss = [
+                        fx.Float32(
+                            bo.buffer_load(
+                                r_ks,
+                                pages[j] * PAGE16 + l16,
+                                vec_width=1,
+                                dtype=T.f32,
+                                cache_modifier=CM_K1,
+                            )
+                        )
+                        for j in range(PPW)
+                    ]
+                    vss = [
+                        fx.Float32(
+                            bo.buffer_load(
+                                r_vs,
+                                pages[j] * PAGE16 + l16,
+                                vec_width=1,
+                                dtype=T.f32,
+                                cache_modifier=CM_K1,
+                            )
+                        )
+                        for j in range(PPW)
+                    ]
                 fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
                 gpu.barrier()
                 stamp(12)
@@ -1000,7 +1106,7 @@ def build_post_attn_kernel(
                     for s in range_constexpr(HEAD_DIM // 32):
                         qw = fx.Vector(
                             fx.ptr_load(
-                                q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i
+                                q8 + (l16 * 32 + q_k(s)), result_type=v2i
                             )
                         )
                         c = mfma_fp8(
@@ -1093,8 +1199,7 @@ def build_post_attn_kernel(
                     for e in range_constexpr(4):
                         fx.ptr_store(
                             cv[e],
-                            opart
-                            + (wave * O_K + (g4 * 4 + e) * HEAD_DIM + 16 * jd + l16),
+                            opart + (wave * O_K + (g4 * 4 + e) * HEAD_DIM + kv_dim(jd)),
                         )
                 gpu.barrier()
                 stamp(15)
