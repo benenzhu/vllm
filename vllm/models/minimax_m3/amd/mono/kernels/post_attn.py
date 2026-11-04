@@ -93,6 +93,7 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
     hw_rsq,
     kernel_symbol,
     memrealtime,
+    mfma_f16,
     rsrc,
     uniform,
     unlikely,
@@ -105,6 +106,8 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
 )
 from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import (
     e4m3x8,
+    f16_pair,
+    f16x8,
     k_scale_off,
     scale_pair,
     scale_pairs8,
@@ -250,6 +253,8 @@ def build_post_attn_kernel(
     CM_K1 = CM_DEV if fuse_k1 else 0
     WIDE = wide_moe(tokens)
     POOL = pool_words(tokens)
+    NV4 = mono_config.KV_FORMAT == "nvfp4"  # NVFP4 KV / index cache (nvfp4.py)
+    assert not NV4 or H * SPLIT_KEYS // 4 >= O_K // 2  # the split's fp16 q fits p8
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 
     @fx.struct
@@ -258,6 +263,8 @@ def build_post_attn_kernel(
         # mid; wide: also the split's PV partials (the stages take turns)
         x: fx.Array[fx.Int32, POOL, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        # the split's P (fp8); NVFP4: also its fp16 q before (H * HEAD_DIM halves:
+        # the same 4 KB; QK reads q before the barrier P is stored after)
         p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
         opart: fx.Array[fx.Float32, 1 if WIDE else WAVES * O_K, 16]  # PV partials
@@ -904,12 +911,8 @@ def build_post_attn_kernel(
         def stage_split():
             r_k, r_v = rsrc(k_cache), rsrc(v_cache)
             r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
-            nvfp4 = mono_config.KV_FORMAT == "nvfp4"
-
-            def q_k(s):
-                """Dword of q8's head row holding this lane's k of chunk s (the
-                operand dims: 32 s + 8 g4, NVFP4 32 g4 + 8 s)."""
-                return 8 * g4 + 2 * s if nvfp4 else 8 * s + 2 * g4
+            nvfp4 = NV4
+            v4i = fx.Vector.make_type(4, fx.Int32)
 
             def kv_dim(jd):
                 """PV output column (B column l16) jd's dim: 16 jd + l16, NVFP4
@@ -952,11 +955,11 @@ def build_post_attn_kernel(
                 qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
                 if const_expr(nvfp4):
                     # NVFP4 pages (``nvfp4.py``): page id = page128 * 8 + its
-                    # page-16. K (QK B operand) key l16 of page j, dims 32 g4 + 8 s
-                    # .. + 8 for chunk s (a 16 B load; the q A operand takes the
-                    # same k order); V (PV B operand) dim kv_dim(jd) of keys
-                    # 8 (lane / 16) .. + 8: the octet's dword, two 16 B loads.
-                    # The scales are the layer's global ones.
+                    # page-16. K (QK B operand, exact fp16) key l16 of page j, dims
+                    # 32 g4 + 8 s .. + 8 for chunk s (a 16 B load; the fp16 q A
+                    # operand takes the same k order); V (PV B operand, e4m3) dim
+                    # kv_dim(jd) of keys 8 (lane / 16) .. + 8: the octet's dword,
+                    # two 16 B loads. The scales are the layer's global ones.
                     kw = []
                     for j in range_constexpr(PPW):
                         kb = (pages[j] >> 3) * NVFP4_PAGE_BYTES
@@ -986,7 +989,7 @@ def build_post_attn_kernel(
                         ) >> ((soff % 4) * 8)
                         for ch in range_constexpr(HEAD_DIM // 32):
                             kw.append(
-                                e4m3x8(
+                                f16x8(
                                     codes[ch],
                                     [scale_pair((sw >> ((ch // 2) * 8)) & 0xFF)] * 4,
                                 )
@@ -1096,7 +1099,16 @@ def build_post_attn_kernel(
                         )
                         for j in range(PPW)
                     ]
-                fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
+                if const_expr(nvfp4):
+                    fx.ptr_store(
+                        fx.Vector.from_elements(
+                            [f16_pair(qv[0], qv[1]), f16_pair(qv[2], qv[3])],
+                            fx.Float32,
+                        ).bitcast(fx.Int32),
+                        p8 + 2 * tid,
+                    )
+                else:
+                    fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
                 gpu.barrier()
                 stamp(12)
                 # QK per page: A=q (heads), B=K (keys); a lane holds heads
@@ -1107,14 +1119,25 @@ def build_post_attn_kernel(
                 for j in range_constexpr(PPW):
                     c = fx.Vector.filled(4, 0.0, fx.Float32)
                     for s in range_constexpr(HEAD_DIM // 32):
-                        qw = fx.Vector(
-                            fx.ptr_load(
-                                q8 + (l16 * 32 + q_k(s)), result_type=v2i
+                        if const_expr(nvfp4):
+                            # fp16 q (in p8) of dims 32 g4 + 8 s .. + 8 (K's order)
+                            qh = fx.Vector(
+                                fx.ptr_load(
+                                    p8 + (l16 * 64 + 16 * g4 + 4 * s), result_type=v4i
+                                )
+                            ).bitcast(fx.Float16)
+                            c = mfma_f16(qh, kw[j * (HEAD_DIM // 32) + s], c)
+                        else:
+                            qw = fx.Vector(
+                                fx.ptr_load(
+                                    q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i
+                                )
                             )
-                        )
-                        c = mfma_fp8(
-                            qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
-                        )
+                            c = mfma_fp8(
+                                qw.bitcast(fx.Int64)[0],
+                                kw[j * (HEAD_DIM // 32) + s],
+                                c,
+                            )
                     qk = sm_scale * kss[j]
                     sc.append(
                         [valid[j].select(qk * c[e], fx.Float32(NEG)) for e in range(4)]

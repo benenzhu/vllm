@@ -19,9 +19,10 @@ e2m1 x scale x the layer's fp32 global scale (K / V: ``_k_scale`` /
 - Index page: token t's codes at ``t * 64``, scales at ``NVFP4_CODES * 128 + t * 8
   + g``.
 
-Quantization is the stock insert's, bit for bit; dequantization gives the stock
-decode's values, ``e4m3_rn_satfinite(e2m1 x scale)`` (the fp16 product is exact),
-the global scale applied by the caller.
+Quantization is the stock insert's, bit for bit. Dequantization: the exact fp16
+products e2m1 x scale (|.| <= 6 x 448) for the fp16 MFMAs (QK, index scores;
+``f16x8``), or the stock decode's values ``e4m3_rn_satfinite(e2m1 x scale)`` for
+the FP8 PV MFMA (``e4m3x8``); the global scale applied by the caller.
 """
 
 import flydsl.expr as fx
@@ -118,6 +119,26 @@ def scale_pairs8(w0, w1):
     """Eight e4m3 scale bytes (dwords w0, w1, byte i = value i) as four fp16
     pairs (pair j: values 2 j, 2 j + 1): a V operand's 8 tokens."""
     return [cvt_fp8x2_f16(w, hi) for w in (w0, w1) for hi in (False, True)]
+
+
+def f16x8(codes, pairs):
+    """Eight e2m1 codes (one dword, nibble i = value i) times their scales
+    (``pairs``: four fp16 pairs, pair j for values 2 j, 2 j + 1) -> an 8 x fp16 MFMA
+    operand, value i in lane element i: exact, 8 VALU (no clamp, no e4m3)."""
+    words = [
+        (cvt_fp4x2_f16(codes, j) * pairs[j]).bitcast(fx.Int32)[0]
+        for j in range_constexpr(4)
+    ]
+    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Float16)
+
+
+def f16_pair(a, b):
+    """Two f32 -> one f32-typed word holding (fp16(a), fp16(b)), as ``bf16_pair``."""
+    return (
+        fx.Vector.from_elements([a, b], fx.Float32)
+        .to(fx.Float16)
+        .bitcast(fx.Float32)[0]
+    )
 
 
 def e4m3x8_words(codes, pairs):

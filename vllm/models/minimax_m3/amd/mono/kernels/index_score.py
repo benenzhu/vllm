@@ -55,6 +55,7 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
     kernel_symbol,
     lane_gather,
     mfma_bf16,
+    mfma_f16,
     permlane_swap,
     readlane,
     rsrc,
@@ -62,7 +63,7 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
     uniform,
     unlikely,
 )
-from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import e4m3x8_words, scale_pair
+from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import f16x8, scale_pair
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
@@ -163,7 +164,8 @@ def emit_index_scores(
     g4 = lane // 16
     r_ic = rsrc(index_cache)
     # NVFP4 index pages (``nvfp4.py``): a key's 64 B of codes and 8 scales; the
-    # operands are the stock decode's e4m3 values, then the same bf16 MFMA
+    # operands are their exact fp16 values on the fp16 MFMA (index q in fp16:
+    # ``q_frag``)
     nvfp4 = mono_config.KV_FORMAT == "nvfp4"
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
@@ -259,7 +261,7 @@ def emit_index_scores(
         out = []
         if const_expr(nvfp4):
             # the same transpose of 4 B code parts, then part g4 of chunk s (dims
-            # 32 s + 8 g4 .. + 8, group 2 s + g4 / 2) times its scale
+            # 32 s + 8 g4 .. + 8, group 2 s + g4 / 2) times its scale, in fp16
             for n in range_constexpr(len(tiles)):
                 d = [raw[6 * n + e] for e in range(4)]
                 sc = [raw[6 * n + 4], raw[6 * n + 5]]
@@ -269,11 +271,7 @@ def emit_index_scores(
                 ops = []
                 for s in range_constexpr(HEAD_DIM // 32):
                     sb = (sc[s // 2] >> ((2 * (s % 2) + g4 // 2) * 8)) & 0xFF
-                    ops.append(
-                        fx.Vector.from_elements(
-                            e4m3x8_words(d[s], [scale_pair(sb)] * 4), fx.Int32
-                        )
-                    )
+                    ops.append(f16x8(d[s], [scale_pair(sb)] * 4))
                 out.append(ops)
         else:
             for n in range_constexpr(len(tiles)):
@@ -301,7 +299,10 @@ def emit_index_scores(
         for n, i in enumerate(tiles):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(HEAD_DIM // 32):
-                c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
+                if const_expr(nvfp4):
+                    c = mfma_f16(kw[n][s], qb[s], c)
+                else:
+                    c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
             # lane holds keys 16 i + 4 (lane / 16) + e of column lane % 16
             key0 = b * SPARSE_BLOCK + 16 * i + 4 * g4
             for e in range_constexpr(4):
@@ -427,7 +428,7 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD):
 
     def q_frag_head(tk, s, head):
         lane = fx.thread_idx.x % 64
-        return fx.Vector(
+        q = fx.Vector(
             bo.buffer_load(
                 rsrc(iq),
                 ((tk * heads.count + head) * HEAD_DIM + 32 * s + 8 * (lane // 16)) // 2,
@@ -435,6 +436,9 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD):
                 dtype=T.i32,
             )
         ).bitcast(fx.BFloat16)
+        if const_expr(mono_config.KV_FORMAT == "nvfp4"):  # the fp16 index MFMA
+            return q.to(fx.Float32).to(fx.Float16)
+        return q
 
     def q_frag(tk, s):
         return q_frag_head(tk, s, heads.own)

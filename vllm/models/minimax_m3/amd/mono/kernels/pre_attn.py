@@ -74,7 +74,11 @@ from vllm.models.minimax_m3.amd.mono.kernels.index_score import (
     index_scale_log2e,
     step_rows,
 )
-from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import k_scale_off, quant4
+from vllm.models.minimax_m3.amd.mono.kernels.nvfp4 import (
+    f16_pair,
+    k_scale_off,
+    quant4,
+)
 
 FP8_MAX = 448.0
 ROWS_PER_TASK = 16
@@ -744,6 +748,7 @@ def emit_k1(
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
     mbox = Mailbox(scratch, step, layer)
+    nvfp4 = mono_config.KV_FORMAT == "nvfp4"  # index q in fp16 (index_score)
     qkv_mb = mbox.addr(SCRATCH_QKV)
     x8_mb = mbox.addr(SCRATCH_X8)
     x8s_mb = mbox.addr(SCRATCH_X8S)
@@ -764,8 +769,10 @@ def emit_k1(
         e = [got[h][j].bitcast(fx.Float32) for h in range(2) for j in range(2)]
         out = head_norm_rope(e, lane, gw4, cs, sn, eps)
         row = qs + (tk * heads.count + head) * (HEAD_DIM // 2)
-        fx.ptr_store(bf16_pair(out[0], out[1]), row + lane * 2)
-        fx.ptr_store(bf16_pair(out[2], out[3]), row + (lane * 2 + 1))
+        # NVFP4 index cache: fp16 pairs for the scorer's fp16 MFMA
+        pair = f16_pair if nvfp4 else bf16_pair
+        fx.ptr_store(pair(out[0], out[1]), row + lane * 2)
+        fx.ptr_store(pair(out[2], out[3]), row + (lane * 2 + 1))
 
     def make_index_q(first, last):
         """Tokens first..last's index q of this rank's head into qs: wave w makes
@@ -794,7 +801,7 @@ def emit_k1(
                 qs + (row + (32 * s + 8 * (lane // 16)) // 2),
                 result_type=fx.Vector.make_type(4, fx.Float32),
             )
-        ).bitcast(fx.BFloat16)
+        ).bitcast(fx.Float16 if nvfp4 else fx.BFloat16)
 
     def q_frag(tk, s):
         """This lane's MFMA B operand of token tk's index q (this rank's head),
