@@ -758,14 +758,21 @@ class GroupCoordinator:
         if not self.dbo_overlap:
             return self.device_communicator.all_reduce(input_)
         # DBO hand-off, on the comm stream. Under the vllm.all_reduce custom op,
-        # so compiled graphs reach it too; no-ops outside a microbatch.
+        # so compiled graphs reach it too.
         from vllm.v1.worker.ubatching import (
+            dbo_enabled,
             dbo_switch_to_compute_sync,
             dbo_yield_and_switch_from_compute_to_comm,
         )
 
+        if not dbo_enabled():
+            return self.device_communicator.all_reduce(input_)
+        # Allocate the output on the compute stream: a block from the comm
+        # stream's pool can be reused by the other microbatch's all-reduce while
+        # this microbatch is still reading it.
+        out = torch.empty_like(input_)
         dbo_yield_and_switch_from_compute_to_comm()
-        out = self.device_communicator.all_reduce(input_)
+        out = self.device_communicator.all_reduce(input_, out=out)
         dbo_switch_to_compute_sync()
         return out
 

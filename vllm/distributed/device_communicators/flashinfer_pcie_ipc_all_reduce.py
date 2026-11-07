@@ -168,9 +168,11 @@ class FlashInferPcieIpcAllReduce:
             and workspace.supports(inp)
         )
 
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+    def all_reduce(
+        self, inp: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         assert self.workspace is not None
-        return self.workspace.all_reduce(inp)
+        return self.workspace.all_reduce(inp, out=out)
 
     @contextmanager
     def capture(self):

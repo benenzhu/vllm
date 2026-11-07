@@ -70,8 +70,19 @@ class AiterCustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return self._impl.should_custom_ar(inp)
 
-    def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
-        return self._impl.custom_all_reduce(inp)
+    def custom_all_reduce(
+        self, inp: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        impl = self._impl
+        if out is None:
+            return impl.custom_all_reduce(inp)
+        # impl.custom_all_reduce's dispatch, writing into out.
+        if not impl._IS_CAPTURING:
+            return impl.all_reduce(inp, out=out)
+        if not torch.cuda.is_current_stream_capturing():
+            return out
+        registered = impl._capture_registered(inp)
+        return impl.all_reduce(inp, out=out, registered_input=registered)
 
     def should_custom_ag(self, inp: torch.Tensor) -> bool:
         return self._impl.should_custom_ag(inp)
