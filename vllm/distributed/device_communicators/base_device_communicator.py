@@ -250,7 +250,12 @@ class DeviceCommunicatorBase:
         self.all2all_backend = all2all_backend
         self.all2all_manager: All2AllManagerBase | None = None
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def all_reduce(
+        self, input_: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``out``, if given, receives the result."""
+        if out is not None:
+            input_ = out.copy_(input_)
         dist.all_reduce(input_, group=self.device_group)
         return input_
 

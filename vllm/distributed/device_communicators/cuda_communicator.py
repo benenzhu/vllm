@@ -381,7 +381,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
-    def all_reduce(self, input_):
+    def all_reduce(self, input_, out: torch.Tensor | None = None):
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -396,24 +396,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not use_fi_ar
             and should_nccl_symm_mem_allreduce(self.pynccl_comm.world_size, input_)
         ):
-            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
-            if out is not None:
-                return out
+            result = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+            if result is not None:
+                return result if out is None else out.copy_(result)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
         ):
-            out = qr_comm.quick_all_reduce(input_)
+            out = qr_comm.quick_all_reduce(input_, out=out)
             assert out is not None
             return out
         fi_pcie_ipc_ar_comm = self.fi_pcie_ipc_ar_comm
         if fi_pcie_ipc_ar_comm is not None and fi_pcie_ipc_ar_comm.should_use(input_):
-            return fi_pcie_ipc_ar_comm.all_reduce(input_)
+            return fi_pcie_ipc_ar_comm.all_reduce(input_, out=out)
         if use_fi_ar:
             assert fi_ar_comm is not None
-            out = fi_ar_comm.all_reduce(input_)
+            out = fi_ar_comm.all_reduce(input_, out=out)
             assert out is not None
             return out
         aiter_ar_comm = self.aiter_ar_comm
@@ -423,16 +423,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not aiter_ar_comm.disabled
             and aiter_ar_comm.should_custom_ar(input_)
         ):
-            out = aiter_ar_comm.custom_all_reduce(input_)
-            assert out is not None
-            return out
+            result = aiter_ar_comm.custom_all_reduce(input_)
+            assert result is not None
+            return result if out is None else out.copy_(result)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            out = ca_comm.custom_all_reduce(input_)
+            out = ca_comm.custom_all_reduce(input_, out=out)
             assert out is not None
             return out
         if (
@@ -445,19 +445,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 all_reduce_batch_invariant,
             )
 
-            return all_reduce_batch_invariant(input_, self.device_group)
+            result = all_reduce_batch_invariant(input_, self.device_group)
+            return result if out is None else out.copy_(result)
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
-            out = symm_mem_comm.all_reduce(input_)
+            out = symm_mem_comm.all_reduce(input_, out=out)
             assert out is not None
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
-            out = input_.clone()
+            out = input_.clone() if out is None else out.copy_(input_)
             torch.distributed.all_reduce(out, group=self.device_group)
             return out
         assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_)
+        out = pynccl_comm.all_reduce(input_, out_tensor=out)
         if out is None:
             # fall back to the default all-reduce using PyTorch.
             # this usually happens during testing.

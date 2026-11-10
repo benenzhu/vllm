@@ -547,23 +547,27 @@ class CustomAllreduce:
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
 
-    def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
+    def custom_all_reduce(
+        self, input: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=self._capture_registered)
+                return self.all_reduce(
+                    input, out=out, registered=self._capture_registered
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
-                return torch.empty_like(input)
+                return torch.empty_like(input) if out is None else out
         else:
             # Note: outside of cuda graph context, custom allreduce incurs a
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
-            return self.all_reduce(input, registered=False)
+            return self.all_reduce(input, out=out, registered=False)
 
     def should_custom_all_gather(self, inp: torch.Tensor) -> bool:
         if self.disabled or not current_platform.is_cuda():
