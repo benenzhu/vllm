@@ -5,6 +5,7 @@
 import copy
 import gc
 import os
+import sys
 import time
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -611,6 +612,10 @@ class Worker(WorkerBase):
         """Set up the workspace manager, build the model runner, report usage."""
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        pc = self.vllm_config.parallel_config
+        if self.use_v2_model_runner and pc.dbo_tp_only:
+            # Both microbatches compute on one stream: one workspace set.
+            num_ubatches = 1
         init_workspace_manager(
             self.device,
             num_ubatches,
@@ -1279,6 +1284,12 @@ class Worker(WorkerBase):
             )
             self.model_runner._dummy_sampler_run(hidden_states=sample_hidden_states)
             del sample_hidden_states
+
+        if "amd_kernels" in sys.modules:
+            # its variants compiled during start-up: log any later compile
+            from amd_kernels import compile_watch
+
+            compile_watch.arm(logger.warning)
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

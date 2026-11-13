@@ -17,6 +17,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+AmdKernelsRoute = Literal[
+    "gemm",
+    "moe",
+    "qkv",
+    "attention",
+    "indexer",
+    "norm",
+    "draft",
+    "sampling",
+    "top_p",
+    "sp_prefill",
+]
+
+
+@config
+class AmdKernelsConfig:
+    """MiniMax-M3.1 layers on ``amd_kernels`` (ROCm gfx950, TP4)."""
+
+    enabled: bool = True
+    """Use ``amd_kernels`` where it is installed and the shapes fit."""
+
+    disabled_routes: list[AmdKernelsRoute] = Field(default_factory=list)
+    """Routes that keep the stock kernels."""
+
+    def compute_hash(self) -> str:
+        return hash_factors(get_hash_factors(self, set()))
+
+
 @config
 class IrOpPriorityConfig:
     """Configuration for vLLM IR op priority for dispatching/lowering during the
@@ -314,6 +342,9 @@ class KernelConfig:
     requests, with bf16 MoE activations instead of the checkpoint's MXFP4). A
     deployment that cannot run it is refused at startup."""
 
+    amd_kernels: AmdKernelsConfig = Field(default_factory=AmdKernelsConfig)
+    """MiniMax-M3.1 on ``amd_kernels``; see ``AmdKernelsConfig``."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 
@@ -468,11 +499,13 @@ class KernelConfig:
             "enable_rocm_segmented_attn_autotune",
             "enable_rocm_aiter_gemm_warmup",
             "ir_op_priority",  # handled separately below
+            "amd_kernels",  # handled separately below
         }
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
+        factors["amd_kernels"] = self.amd_kernels.compute_hash()
         return hash_factors(factors)
 
     @field_validator(
