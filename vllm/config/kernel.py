@@ -17,6 +17,34 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+AmdKernelsRoute = Literal[
+    "gemm",
+    "moe",
+    "qkv",
+    "attention",
+    "indexer",
+    "norm",
+    "draft",
+    "sampling",
+    "top_p",
+    "sp_prefill",
+]
+
+
+@config
+class AmdKernelsConfig:
+    """MiniMax-M3.1 layers on `amd_kernels` (ROCm gfx950, TP4)."""
+
+    enabled: bool = True
+    """Use `amd_kernels` where it is installed and the shapes fit."""
+
+    disabled_routes: list[AmdKernelsRoute] = Field(default_factory=list)
+    """Routes that keep the stock kernels."""
+
+    def compile_factors(self) -> CompileFactors:
+        return get_compile_factors(self, set())
+
+
 @config
 class IrOpPriorityConfig:
     """Configuration for vLLM IR op priority for dispatching/lowering during the
@@ -317,6 +345,9 @@ class KernelConfig:
     requests, with bf16 MoE activations instead of the checkpoint's MXFP4). A
     deployment that cannot run it is refused at startup."""
 
+    amd_kernels: AmdKernelsConfig = Field(default_factory=AmdKernelsConfig)
+    """MiniMax-M3.1 on `amd_kernels`; see `AmdKernelsConfig`."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 
@@ -331,9 +362,10 @@ class KernelConfig:
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_moe_ep_cutedsl": Use FlashInfer's CuTeDSL MoE-EP
-      mega-kernel with NVFP4 weights (MXFP4 checkpoints are requantized at
-      load) on Blackwell, or with block-FP8 (128x128) weights on Hopper;
-      requires expert parallelism and NVSHMEM
+      mega-kernel with NVFP4 weights on Blackwell (SM100/SM103, where MXFP4
+      checkpoints are requantized at load, or SM107 for NVFP4 checkpoints
+      only), or with block-FP8 (128x128) weights on Hopper; requires expert
+      parallelism and NVSHMEM
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "b12x": Use b12x FP4 MoE kernels on SM12x
